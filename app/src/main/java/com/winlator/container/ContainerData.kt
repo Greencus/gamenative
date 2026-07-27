@@ -78,7 +78,7 @@ data class ContainerData(
     val dinputMapperType: Byte = 1,
     /** Disable external mouse input **/
     val disableMouseInput: Boolean = false,
-    /** Touchscreen mode (defaults on for XR builds) **/
+    /** Touchscreen mode (defaults on for GameNativeVR builds) **/
     val touchscreenMode: Boolean = app.gamenative.BuildConfig.XR_BUILD,
     /** Shooter mode (auto-replace sticks with dynamic joysticks) **/
     val shooterMode: Boolean = true,

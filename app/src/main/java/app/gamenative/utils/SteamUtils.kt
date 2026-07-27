@@ -521,7 +521,70 @@ object SteamUtils {
                 Character.getType(char) != Character.FORMAT.toInt()
         }.trim()
 
-    internal fun writeColdClientIni(steamAppId: Int, container: Container, launchInfo: LaunchInfo? = null) {
+    internal fun resolveLaunchExecutablePath(
+        appDir: File,
+        gameName: String,
+        vararg candidates: String,
+    ): String {
+        val normalizedCandidates = candidates
+            .asSequence()
+            .map { normalizeSteamExecutablePath(it, gameName) }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toList()
+
+        if (normalizedCandidates.isEmpty() || !appDir.isDirectory) return ""
+
+        normalizedCandidates.forEach { relativePath ->
+            val file = FileUtils.findFileCaseInsensitive(appDir, relativePath)
+            if (file?.isFile == true) {
+                return file.relativeTo(appDir).invariantSeparatorsPath
+            }
+        }
+
+        return ""
+    }
+
+    private fun normalizeSteamExecutablePath(executablePath: String, gameName: String): String {
+        var normalized = executablePath
+            .trim()
+            .trim('"')
+            .replace('\\', '/')
+            .trimStart('/')
+
+        while (normalized.startsWith("./")) {
+            normalized = normalized.removePrefix("./")
+        }
+
+        if (normalized.isBlank()) return ""
+
+        val lower = normalized.lowercase(Locale.ROOT)
+        val commonMarker = "/steamapps/common/"
+        val commonIndex = lower.indexOf(commonMarker)
+        if (commonIndex >= 0) {
+            normalized = normalized.substring(commonIndex + commonMarker.length)
+        }
+
+        val gamePrefix = gameName.replace('\\', '/').trim('/')
+        if (gamePrefix.isNotBlank()) {
+            if (normalized.equals(gamePrefix, ignoreCase = true)) {
+                return ""
+            }
+            val prefixedGamePath = "$gamePrefix/"
+            if (normalized.startsWith(prefixedGamePath, ignoreCase = true)) {
+                normalized = normalized.substring(prefixedGamePath.length)
+            }
+        }
+
+        return normalized.trimStart('/')
+    }
+
+    internal fun writeColdClientIni(
+        steamAppId: Int,
+        container: Container,
+        launchInfo: LaunchInfo? = null,
+        exeCommandLineOverride: String? = null,
+    ) {
         val gameName = getAppDirName(getAppInfoOf(steamAppId))
         val workingDir = launchInfo?.workingDir
         val iniFile = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam/ColdClientLoader.ini")
@@ -530,7 +593,7 @@ object SteamUtils {
         val launchConfig = resolveColdClientLaunchConfig(
             steamAppId = steamAppId,
             executablePath = container.executablePath,
-            exeCommandLine = container.execArgs,
+            exeCommandLine = exeCommandLineOverride ?: container.execArgs,
             gameRootDir = File(SteamService.getAppDirPath(steamAppId)),
         )
         iniFile.parentFile?.mkdirs()

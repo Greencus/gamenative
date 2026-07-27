@@ -9,7 +9,6 @@ import android.widget.Toast;
 import app.gamenative.R;
 import com.winlator.widget.FrameRating;
 import com.winlator.widget.XServerRendererView;
-import com.winlator.widget.XServerView;
 import com.winlator.xserver.Bitmask;
 import com.winlator.xserver.Cursor;
 import com.winlator.xserver.Drawable;
@@ -42,7 +41,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     public static final int EFFECT_MASK_CRT = 1 << 3;
     public static final int EFFECT_MASK_NTSC = 1 << 4;
 
-    public final XServerView xServerView;
+    public final XServerRendererView xServerView;
     private final XServer xServer;
     private long nativeHandle = 0;
     private final Object lock = new Object();
@@ -79,7 +78,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     private android.view.Surface        scanoutGameSurface;
     private android.view.Surface        scanoutCursorSurface;
 
-    public VulkanRenderer(XServerView xServerView, XServer xServer) {
+    public VulkanRenderer(XServerRendererView xServerView, XServer xServer) {
         this.xServerView = xServerView;
         this.xServer = xServer;
         rootCursorDrawable = createRootCursorDrawable();
@@ -181,7 +180,8 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
                             releaseScanoutSurfaces();
                             if (android.os.Build.VERSION.SDK_INT >= 29) {
                                 try {
-                                    android.view.SurfaceControl xsc = xServerView.getSurfaceControl();
+                                    android.view.SurfaceControl xsc = xServerView.getRendererSurfaceControl();
+                                    if (xsc == null) throw new IllegalStateException("Renderer view has no SurfaceControl");
                                     scanoutGameSC = new android.view.SurfaceControl.Builder()
                                         .setParent(xsc).setName("winlator_game").setOpaque(true).build();
                                     scanoutGameSurface = new android.view.Surface(scanoutGameSC);
@@ -627,7 +627,8 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
         xServerView.post(() -> {
             if (android.os.Build.VERSION.SDK_INT >= 29) {
                 try {
-                    android.view.SurfaceControl xsc = xServerView.getSurfaceControl();
+                    android.view.SurfaceControl xsc = xServerView.getRendererSurfaceControl();
+                    if (xsc == null) throw new IllegalStateException("Renderer view has no SurfaceControl");
                     scanoutGameSC = new android.view.SurfaceControl.Builder()
                         .setParent(xsc).setName("winlator_game").setOpaque(true).build();
                     scanoutGameSurface = new android.view.Surface(scanoutGameSC);

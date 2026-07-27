@@ -12,6 +12,7 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,16 +21,20 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import app.gamenative.ui.component.NoExtractOutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
@@ -88,6 +93,8 @@ import app.gamenative.ui.util.SnackbarManager
 import app.gamenative.ui.util.SteamSaveTransfer
 import app.gamenative.utils.ContainerUtils.getContainer
 import app.gamenative.utils.CustomGameScanner
+import app.gamenative.xr.XrLaunchPreferences
+import app.gamenative.xr.XrRuntimeManager
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.json.JSONObject
@@ -132,6 +139,32 @@ private fun buildNotEnoughSpaceState(context: Context, info: InstallSizeInfo): M
         message = message,
         confirmBtnText = context.getString(R.string.acknowledge),
     )
+}
+
+@Composable
+private fun VrRadioRow(
+    selected: Boolean,
+    label: String,
+    description: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Column(modifier = Modifier.weight(1f)) {
+            TextButton(onClick = onClick) {
+                Text(label)
+            }
+            if (description.isNotBlank()) {
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
 }
 
 /**
@@ -200,6 +233,8 @@ class SteamAppScreen : BaseAppScreen() {
         }
 
         private val branchDialogVisibleIds = mutableStateListOf<Int>()
+        private val vrLaunchDialogVisible = mutableStateMapOf<Int, Boolean>()
+        private val vrLaunchAfterSave = mutableStateMapOf<Int, Boolean>()
 
         fun showBranchDialog(gameId: Int) {
             if (gameId !in branchDialogVisibleIds) branchDialogVisibleIds.add(gameId)
@@ -210,6 +245,20 @@ class SteamAppScreen : BaseAppScreen() {
         }
 
         fun shouldShowBranchDialog(gameId: Int): Boolean = gameId in branchDialogVisibleIds
+
+        fun showVrLaunchDialog(gameId: Int, launchAfterSave: Boolean) {
+            vrLaunchAfterSave[gameId] = launchAfterSave
+            vrLaunchDialogVisible[gameId] = true
+        }
+
+        fun hideVrLaunchDialog(gameId: Int) {
+            vrLaunchDialogVisible.remove(gameId)
+            vrLaunchAfterSave.remove(gameId)
+        }
+
+        fun shouldShowVrLaunchDialog(gameId: Int): Boolean = vrLaunchDialogVisible[gameId] == true
+
+        fun shouldLaunchAfterVrDialogSave(gameId: Int): Boolean = vrLaunchAfterSave[gameId] == true
 
         // Shared state for update/verify operation - map of gameId to AppOptionMenuType
         private val pendingUpdateVerifyOperations = mutableStateMapOf<Int, AppOptionMenuType>()
@@ -549,7 +598,14 @@ class SteamAppScreen : BaseAppScreen() {
                 )
             )
         } else {
-            onClickPlay(false)
+            val container = ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
+            val launchInfos = SteamService.getWindowsLaunchInfos(gameId)
+            val hasMeaningfulChoices = launchInfos.size > 1 || launchInfos.any(XrLaunchPreferences::isVrLaunchInfo)
+            if (BuildConfig.XR_BUILD && hasMeaningfulChoices && XrLaunchPreferences.shouldPromptEveryLaunch(container)) {
+                showVrLaunchDialog(gameId, launchAfterSave = true)
+            } else {
+                onClickPlay(false)
+            }
         }
     }
 
@@ -767,6 +823,12 @@ class SteamAppScreen : BaseAppScreen() {
                 }
             ),
             AppMenuOption(
+                AppOptionMenuType.VrLaunchOptions,
+                onClick = {
+                    showVrLaunchDialog(gameId, launchAfterSave = false)
+                }
+            ),
+            AppMenuOption(
                 AppOptionMenuType.VerifyFiles,
                 onClick = {
                     // Show confirmation dialog before verifying
@@ -882,11 +944,29 @@ class SteamAppScreen : BaseAppScreen() {
         onDismiss: () -> Unit,
         onEditContainer: () -> Unit,
         onBack: () -> Unit,
+        onClickPlay: (Boolean) -> Unit,
     ) {
         val context = LocalContext.current
         val gameId = libraryItem.gameId
         val appInfo = remember(libraryItem.appId) {
             SteamService.getAppInfoOf(gameId)
+        }
+        val container = remember(libraryItem.appId) {
+            ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
+        }
+        val launchInfos = remember(gameId) {
+            SteamService.getWindowsLaunchInfos(gameId)
+        }
+
+        var showVrLaunchDialog by remember(gameId) {
+            mutableStateOf(shouldShowVrLaunchDialog(gameId))
+        }
+
+        LaunchedEffect(gameId) {
+            snapshotFlow { shouldShowVrLaunchDialog(gameId) }
+                .collect { shouldShow ->
+                    showVrLaunchDialog = shouldShow
+                }
         }
 
         // Track uninstall dialog state
@@ -1086,6 +1166,133 @@ class SteamAppScreen : BaseAppScreen() {
                     )
                 }
             }
+        }
+
+        if (showVrLaunchDialog) {
+            var selectedMode by remember(gameId) {
+                mutableStateOf(XrLaunchPreferences.mode(container))
+            }
+            var selectedLaunchIndex by remember(gameId) {
+                mutableIntStateOf(
+                    XrLaunchPreferences.selectedSteamLaunchIndex(container)
+                        .takeIf { it in launchInfos.indices }
+                        ?: launchInfos.indexOfFirst(XrLaunchPreferences::isVrLaunchInfo)
+                            .takeIf { it >= 0 }
+                        ?: launchInfos.indices.firstOrNull()
+                        ?: -1,
+                )
+            }
+            var customArgs by remember(gameId) {
+                mutableStateOf(XrLaunchPreferences.customArgs(container))
+            }
+            var promptEveryLaunch by remember(gameId) {
+                mutableStateOf(XrLaunchPreferences.shouldPromptEveryLaunch(container))
+            }
+            var openCompositeEnabled by remember(gameId) {
+                mutableStateOf(XrRuntimeManager.isOpenCompositeEnabled(container))
+            }
+            val launchAfterSave = shouldLaunchAfterVrDialogSave(gameId)
+
+            AlertDialog(
+                onDismissRequest = { hideVrLaunchDialog(gameId) },
+                title = { Text("GameNativeVR launch options") },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 520.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        Text("Display mode", style = MaterialTheme.typography.titleSmall)
+                        VrRadioRow(
+                            selected = selectedMode == XrLaunchPreferences.MODE_AUTO,
+                            label = "Auto",
+                            description = "Use GameNativeVR when the selected Steam launch entry looks like a VR entry.",
+                            onClick = { selectedMode = XrLaunchPreferences.MODE_AUTO },
+                        )
+                        VrRadioRow(
+                            selected = selectedMode == XrLaunchPreferences.MODE_VR,
+                            label = "GameNativeVR",
+                            description = "Show flat games in the Quest theater; OpenXR games switch to immersive stereo.",
+                            onClick = { selectedMode = XrLaunchPreferences.MODE_VR },
+                        )
+                        VrRadioRow(
+                            selected = selectedMode == XrLaunchPreferences.MODE_FLAT,
+                            label = "Flat screen",
+                            description = "Launch through the normal XServer activity, even on Quest.",
+                            onClick = { selectedMode = XrLaunchPreferences.MODE_FLAT },
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        Text("Steam launch entry", style = MaterialTheme.typography.titleSmall)
+                        if (launchInfos.isEmpty()) {
+                            Text(
+                                text = "No Steam launch metadata is cached for this game. GameNative will use the configured executable.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        } else {
+                            launchInfos.forEachIndexed { index, launchInfo ->
+                                VrRadioRow(
+                                    selected = selectedLaunchIndex == index,
+                                    label = XrLaunchPreferences.displayName(launchInfo, index),
+                                    description = launchInfo.workingDir.ifBlank { launchInfo.type },
+                                    onClick = { selectedLaunchIndex = index },
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = customArgs,
+                            onValueChange = { customArgs = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Extra GameNativeVR arguments") },
+                            placeholder = { Text("-vr -openxr") },
+                            singleLine = true,
+                        )
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = promptEveryLaunch,
+                                onCheckedChange = { promptEveryLaunch = it },
+                            )
+                            Text("Ask before every launch")
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = openCompositeEnabled,
+                                onCheckedChange = { openCompositeEnabled = it },
+                            )
+                            Text("Use OpenComposite for SteamVR games")
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            XrLaunchPreferences.save(
+                                container = container,
+                                mode = selectedMode,
+                                steamLaunchIndex = selectedLaunchIndex,
+                                customArgs = customArgs,
+                                promptEveryLaunch = promptEveryLaunch,
+                            )
+                            XrRuntimeManager.setOpenCompositeEnabled(container, openCompositeEnabled)
+                            hideVrLaunchDialog(gameId)
+                            if (launchAfterSave) {
+                                onClickPlay(false)
+                            }
+                        },
+                    ) {
+                        Text(if (launchAfterSave) "Launch GameNativeVR" else "Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { hideVrLaunchDialog(gameId) }) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                },
+            )
         }
 
         // Install dialog (INSTALL_APP, NOT_ENOUGH_SPACE, CANCEL_APP_DOWNLOAD)

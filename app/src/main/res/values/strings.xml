@@ -1,5 +1,6 @@
 ﻿<resources>
     <string name="app_name">GameNative</string>
+    <string name="gamenative_vr_name">GameNativeVR</string>
     <string name="login_user">User Login</string>
     <string name="login_2fa">Two Factor</string>
     <string name="home">Home</string>
@@ -1991,6 +1992,7 @@
     <string name="nexus_unpacked_size">%1$s unpacked</string>
     <string name="nexus_unpacking_archive">Unpacking archive</string>
     <string name="nexus_profile_name_duplicate">A profile with that name already exists</string>
+    <string name="option_vr_launch_options">GameNativeVR launch options</string>
     <!-- Recommendations -->
     <string name="recommended_badge">Recommended</string>
     <string name="recommended_buy_button">Check It Out</string>

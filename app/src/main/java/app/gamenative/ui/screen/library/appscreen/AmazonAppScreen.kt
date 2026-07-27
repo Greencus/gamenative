@@ -628,6 +628,7 @@ override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean =
         onDismiss: () -> Unit,
         onEditContainer: () -> Unit,
         onBack: () -> Unit,
+        onClickPlay: (Boolean) -> Unit,
     ) {
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
