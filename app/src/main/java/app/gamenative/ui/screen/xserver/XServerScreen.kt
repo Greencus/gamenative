@@ -116,6 +116,10 @@ import app.gamenative.utils.SteamTokenLogin
 import app.gamenative.utils.SteamUtils
 import app.gamenative.utils.downloader.WinComponentDownloader
 import app.gamenative.utils.WineProcessSnapshotHelper
+import app.gamenative.xr.XrRuntimeManager
+import app.gamenative.xr.QuestVrActivity
+import app.gamenative.xr.XrXServerView
+import app.gamenative.xr.XrLaunchPreferences
 import com.posthog.PostHog
 import com.winlator.alsaserver.ALSAClient
 import com.winlator.container.Container
@@ -307,6 +311,7 @@ fun XServerScreen(
     bootToContainer: Boolean,
     testGraphics: Boolean = false,
     isOffline: Boolean = false,
+    launchInfoOverride: LaunchInfo? = null,
     registerBackAction: ( ( ) -> Unit ) -> Unit,
     navigateBack: () -> Unit,
     onExit: (onComplete: (() -> Unit)?) -> Unit,
@@ -391,8 +396,8 @@ fun XServerScreen(
     // var pointerEventListener by remember { mutableStateOf<Callback<MotionEvent>?>(null) }
 
     val gameId = ContainerUtils.extractGameIdFromContainerId(appId)
-    val appLaunchInfo = SteamService.getAppInfoOf(gameId)?.let { appInfo ->
-        SteamService.getWindowsLaunchInfos(gameId).firstOrNull()
+    val appLaunchInfo = launchInfoOverride ?: SteamService.getAppInfoOf(gameId)?.let {
+        XrLaunchPreferences.selectedLaunchInfo(container, SteamService.getWindowsLaunchInfos(gameId))
     }
 
     var currentAppInfo = SteamService.getAppInfoOf(gameId)
@@ -1674,8 +1679,11 @@ fun XServerScreen(
             // other containers as well. Uncheck the per-container useLegacyRenderer
             // setting to switch to the Vulkan renderer.
             val useGLRenderer = container.graphicsDriver == "virgl" || container.isUseLegacyRenderer
+            val useXrRenderer = BuildConfig.XR_BUILD && context is QuestVrActivity && !useGLRenderer
             val xServerViewInstance: XServerRendererView = if (useGLRenderer) {
                 XServerViewGL(context, xServerToUse)
+            } else if (useXrRenderer) {
+                XrXServerView(context, xServerToUse)
             } else {
                 XServerView(context, xServerToUse)
             }
@@ -3191,7 +3199,7 @@ private fun setupXEnvironment(
         }
         gameExecutable = "wine explorer /desktop=shell," + xServer.screenInfo + " " +
             getWineStartCommand(context, appId, container, bootToContainer, testGraphics, appLaunchInfo, envVars, guestProgramLauncherComponent, gameSource, offline) +
-            (if (container.execArgs.isNotEmpty()) " " + container.execArgs else "")
+            effectiveLaunchArgs(container, appLaunchInfo).let { if (it.isNotEmpty()) " $it" else "" }
         preInstallCommands = PreInstallSteps.getPreInstallCommands(
             container,
             appId,
@@ -3206,6 +3214,12 @@ private fun setupXEnvironment(
         guestProgramLauncherComponent.setSteamType(container.getSteamType())
 
         envVars.putAll(container.envVars)
+        XrRuntimeManager.prepareRuntime(
+            context = context,
+            container = container,
+            envVars = envVars,
+            active = context is QuestVrActivity,
+        )
         envVars.remove("DXVK_FRAME_RATE")
         envVars.remove("VKD3D_FRAME_RATE")
         if (!envVars.has("WINEESYNC")) envVars.put("WINEESYNC", "1")
@@ -3498,16 +3512,63 @@ private fun getWineStartCommand(
     val isEpicGame = gameSource == GameSource.EPIC
     val isSteamGame = gameSource == GameSource.STEAM
     val gameId = ContainerUtils.extractGameIdFromContainerId(appId)
+    val effectiveExecArgs = effectiveLaunchArgs(container, appLaunchInfo)
 
     if (isSteamGame) {
         // Steam-specific setup
-        if (container.executablePath.isEmpty()){
-            container.executablePath = SteamService.getInstalledExe(gameId)
-            container.saveData()
+        if (!container.isLaunchRealSteam) {
+            val selectedLaunchIndex = XrLaunchPreferences.selectedSteamLaunchIndex(container)
+            val selectedExecutable = appLaunchInfo?.executable.orEmpty()
+            val installedExecutable = SteamService.getInstalledExe(gameId)
+            val appDirPath = SteamService.getAppDirPath(gameId)
+            val appDirName = SteamService.getAppDirName(SteamService.getAppInfoOf(gameId))
+            val shouldPreferLaunchInfoExecutable =
+                selectedExecutable.isNotBlank() &&
+                    (selectedLaunchIndex >= 0 ||
+                        container.executablePath.isBlank() ||
+                        XrLaunchPreferences.shouldLaunchInVr(container, appLaunchInfo))
+            var resolvedExecutable = if (shouldPreferLaunchInfoExecutable) {
+                SteamUtils.resolveLaunchExecutablePath(
+                    File(appDirPath),
+                    appDirName,
+                    selectedExecutable,
+                    container.executablePath,
+                    installedExecutable,
+                )
+            } else {
+                SteamUtils.resolveLaunchExecutablePath(
+                    File(appDirPath),
+                    appDirName,
+                    container.executablePath,
+                    selectedExecutable,
+                    installedExecutable,
+                )
+            }
+            if (resolvedExecutable.isBlank()) {
+                resolvedExecutable = container.executablePath.ifBlank {
+                    selectedExecutable.ifBlank { installedExecutable }
+                }
+                if (resolvedExecutable.isBlank()) {
+                    Timber.tag("XServerScreen").e("Cannot launch Steam game $appId: executable not found")
+                    return "winhandler.exe \"wfm.exe\""
+                }
+                Timber.tag("XServerScreen").w(
+                    "Steam executable verification failed for $appId; using persisted launch path: $resolvedExecutable"
+                )
+            }
+            if (resolvedExecutable != container.executablePath) {
+                container.executablePath = resolvedExecutable
+                container.saveData()
+            }
         }
         if (!container.isUseLegacyDRM){
             // Create ColdClientLoader.ini file
-            SteamUtils.writeColdClientIni(gameId, container, appLaunchInfo)
+            SteamUtils.writeColdClientIni(
+                steamAppId = gameId,
+                container = container,
+                launchInfo = appLaunchInfo,
+                exeCommandLineOverride = effectiveExecArgs,
+            )
         }
         val controllerVdfText = SteamService.resolveSteamControllerVdfText(gameId)
         if (controllerVdfText.isNullOrEmpty()) {
@@ -3896,6 +3957,16 @@ private fun getWineStartCommand(
 
     return "winhandler.exe $args"
 }
+
+private fun effectiveLaunchArgs(container: Container, appLaunchInfo: LaunchInfo?): String {
+    val args = mutableListOf<String>()
+    container.execArgs.trim().takeIf { it.isNotEmpty() }?.let(args::add)
+    if (XrLaunchPreferences.shouldLaunchInVr(container, appLaunchInfo)) {
+        XrLaunchPreferences.customArgs(container).takeIf { it.isNotEmpty() }?.let(args::add)
+    }
+    return args.joinToString(" ")
+}
+
 private fun getSteamlessTarget(
     appId: String,
     container: Container,

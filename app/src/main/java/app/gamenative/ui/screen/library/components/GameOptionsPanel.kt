@@ -345,6 +345,7 @@ private fun getIconForOption(type: AppOptionMenuType): ImageVector {
         AppOptionMenuType.ExportSaves -> Icons.Default.ArrowUpward
         AppOptionMenuType.ManageGameContent -> Icons.Default.Apps
         AppOptionMenuType.ManageWorkshop -> Icons.Default.Build
+        AppOptionMenuType.VrLaunchOptions -> Icons.Default.Settings
         AppOptionMenuType.ChangeBranch -> Icons.AutoMirrored.Filled.CallSplit
     }
 }
@@ -398,7 +399,8 @@ private fun groupOptions(options: List<AppMenuOption>): Map<OptionCategory, List
             AppOptionMenuType.FetchSteamGridDBImages,
             AppOptionMenuType.TestGraphics,
             AppOptionMenuType.ManageGameContent,
-            AppOptionMenuType.ManageWorkshop
+            AppOptionMenuType.ManageWorkshop,
+            AppOptionMenuType.VrLaunchOptions,
             -> helpInfo.add(option)
         }
     }

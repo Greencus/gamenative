@@ -1,5 +1,7 @@
 package app.gamenative.utils
 
+import java.io.File
+import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -41,6 +43,64 @@ class SteamUtilsColdClientIniTest {
     fun `ExeRunDir is exe directory when workingDir is empty string`() {
         val ini = generate(gameName = "New Star GP", executablePath = "release/NSGP.exe", workingDir = "")
         assertEquals("steamapps\\common\\New Star GP\\release", ini.iniValue("ExeRunDir"))
+    }
+
+    @Test
+    fun `resolveLaunchExecutablePath strips install folder prefix`() {
+        withTempDir { appDir ->
+            File(appDir, "release").mkdirs()
+            File(appDir, "release/NSGP.exe").writeText("exe")
+
+            val resolved = SteamUtils.resolveLaunchExecutablePath(
+                appDir = appDir,
+                gameName = "New Star GP",
+                "New Star GP/release/NSGP.exe",
+            )
+
+            assertEquals("release/NSGP.exe", resolved)
+        }
+    }
+
+    @Test
+    fun `resolveLaunchExecutablePath strips steamapps common prefix`() {
+        withTempDir { appDir ->
+            File(appDir, "release").mkdirs()
+            File(appDir, "release/NSGP.exe").writeText("exe")
+
+            val resolved = SteamUtils.resolveLaunchExecutablePath(
+                appDir = appDir,
+                gameName = "New Star GP",
+                "C:/Program Files (x86)/Steam/steamapps/common/New Star GP/release/NSGP.exe",
+            )
+
+            assertEquals("release/NSGP.exe", resolved)
+        }
+    }
+
+    @Test
+    fun `resolveLaunchExecutablePath returns blank when no candidate exists`() {
+        withTempDir { appDir ->
+            File(appDir, "Release").mkdirs()
+            File(appDir, "Release/NSGP.exe").writeText("exe")
+
+            val resolved = SteamUtils.resolveLaunchExecutablePath(
+                appDir = appDir,
+                gameName = "New Star GP",
+                "release/Missing.exe",
+            )
+
+            assertEquals("", resolved)
+        }
+    }
+
+    private fun withTempDir(block: (File) -> Unit) {
+        val dir = createTempDirectory(prefix = "steam-utils-test")
+        val dirFile = dir.toFile()
+        try {
+            block(dirFile)
+        } finally {
+            dirFile.deleteRecursively()
+        }
     }
 
 }

@@ -1,6 +1,8 @@
 package com.winlator.widget;
 
 import android.content.Context;
+import android.view.Display;
+import android.view.SurfaceControl;
 
 import com.winlator.renderer.XServerRenderer;
 import com.winlator.xserver.XServer;
@@ -12,6 +14,9 @@ import com.winlator.xserver.XServer;
  */
 public interface XServerRendererView {
     Context getContext();
+    boolean post(Runnable action);
+    Display getDisplay();
+    default SurfaceControl getRendererSurfaceControl() { return null; }
     void queueEvent(Runnable r);
     void requestRender();
     void setFrameRateLimit(int limit);

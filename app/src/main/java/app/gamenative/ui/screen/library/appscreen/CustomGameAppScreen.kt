@@ -458,7 +458,8 @@ class CustomGameAppScreen : BaseAppScreen() {
         libraryItem: LibraryItem,
         onDismiss: () -> Unit,
         onEditContainer: () -> Unit,
-        onBack: () -> Unit
+        onBack: () -> Unit,
+        onClickPlay: (Boolean) -> Unit,
     ) {
         val context = LocalContext.current
         val scope = rememberCoroutineScope()

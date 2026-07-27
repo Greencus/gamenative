@@ -5,6 +5,12 @@
     <uses-feature
         android:glEsVersion="0x00020000"
         android:required="true" />
+    <uses-feature
+        android:name="com.oculus.feature.BOUNDARYLESS_APP"
+        android:required="false" />
+    <uses-feature
+        android:name="com.oculus.feature.PASSTHROUGH"
+        android:required="false" />
 
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -19,8 +25,16 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.READ_LOGS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
 
     <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:mimeType="application/vnd.android.package-archive" />
@@ -75,6 +89,23 @@
 
         </activity>
 
+        <activity
+            android:name=".xr.QuestVrActivity"
+            android:configChanges="density|orientation|screenSize|keyboard|keyboardHidden|uiMode|navigation"
+            android:exported="true"
+            android:label="@string/gamenative_vr_name"
+            android:launchMode="singleTop"
+            android:process=":vr_process"
+            android:resizeableActivity="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.Pluvia">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <!-- GOG OAuth (in-app WebView; intercepts redirect for automatic code capture) -->
         <activity
             android:name=".ui.screen.auth.GOGOAuthActivity"
@@ -104,6 +135,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.2D" />
+                <category android:name="com.oculus.intent.category.DEFAULT" />
             </intent-filter>
         </activity-alias>
         <activity-alias
@@ -116,6 +149,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.2D" />
+                <category android:name="com.oculus.intent.category.DEFAULT" />
             </intent-filter>
         </activity-alias>
         <service
@@ -152,6 +187,15 @@
         <receiver
             android:name=".service.NotificationActionReceiver"
             android:exported="false" />
+
+        <receiver
+            android:name=".xr.XrDiagnosticsReceiver"
+            android:exported="true"
+            android:process=":vr_process">
+            <intent-filter>
+                <action android:name="app.gamenative.xr.STATUS" />
+            </intent-filter>
+        </receiver>
 
         <!-- FileProvider for secure file sharing (for APK installation) -->
         <provider

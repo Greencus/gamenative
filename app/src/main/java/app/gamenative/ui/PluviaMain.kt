@@ -101,6 +101,10 @@ import app.gamenative.utils.UpdateChecker
 import app.gamenative.utils.UpdateInfo
 import app.gamenative.utils.UpdateInstaller
 import app.gamenative.utils.LaunchDependencies
+import app.gamenative.xr.QuestVrLauncher
+import app.gamenative.xr.XrLaunchPreferences
+import app.gamenative.xr.XrPayloadManager
+import app.gamenative.xr.XrRuntimeManager
 import app.gamenative.workshop.WorkshopManager
 import com.google.android.play.core.splitcompat.SplitCompat
 import com.winlator.container.Container
@@ -467,7 +471,56 @@ fun PluviaMain(
         viewModel.uiEvent.collect { event ->
             when (event) {
                 MainViewModel.MainUiEvent.LaunchApp -> {
-                    navController.navigate(PluviaScreen.XServer.route)
+                    val activity = context as? android.app.Activity
+                    val launchContainer = runCatching {
+                        ContainerUtils.getContainer(context, state.launchedAppId)
+                    }.getOrNull()
+                    val selectedLaunchInfo = launchContainer?.let { container ->
+                        val gameId = ContainerUtils.extractGameIdFromContainerId(state.launchedAppId)
+                        XrLaunchPreferences.selectedLaunchInfo(
+                            container,
+                            SteamService.getWindowsLaunchInfos(gameId),
+                        )
+                    }
+                    val shouldLaunchQuestVr =
+                        BuildConfig.XR_BUILD &&
+                            activity != null &&
+                            MainActivity.isHeadset(context) &&
+                            !state.bootToContainer &&
+                            !state.testGraphics &&
+                            launchContainer != null &&
+                            XrLaunchPreferences.shouldLaunchInVr(launchContainer, selectedLaunchInfo)
+
+                    if (shouldLaunchQuestVr) {
+                        val gameId = ContainerUtils.extractGameIdFromContainerId(state.launchedAppId)
+                        val resolvedExecutable = if (launchContainer != null) {
+                            val appDirPath = SteamService.getAppDirPath(gameId)
+                            val appDirName = SteamService.getAppDirName(SteamService.getAppInfoOf(gameId))
+                            val installedExecutable = SteamService.getInstalledExe(gameId)
+                            SteamUtils.resolveLaunchExecutablePath(
+                                File(appDirPath),
+                                appDirName,
+                                selectedLaunchInfo?.executable.orEmpty(),
+                                launchContainer.executablePath,
+                                installedExecutable,
+                            ).ifBlank {
+                                launchContainer.executablePath.ifBlank { installedExecutable }
+                            }
+                        } else {
+                            ""
+                        }
+                        QuestVrLauncher.launch(
+                            activity = activity,
+                            appId = state.launchedAppId,
+                            bootToContainer = state.bootToContainer,
+                            testGraphics = state.testGraphics,
+                            isOffline = viewModel.isOffline.value,
+                            resolvedExecutable = resolvedExecutable,
+                            launchInfo = selectedLaunchInfo,
+                        )
+                    } else {
+                        navController.navigate(PluviaScreen.XServer.route)
+                    }
                 }
 
                 is MainViewModel.MainUiEvent.ExternalGameLaunch -> {
@@ -1558,6 +1611,41 @@ fun preLaunchApp(
 
         val gameSource = ContainerUtils.extractGameSourceFromContainerId(appId)
         val isLocalSavesOnly = ContainerUtils.isLocalSavesOnly(context, appId)
+        val selectedSteamLaunchInfo = if (gameSource == GameSource.STEAM) {
+            XrLaunchPreferences.selectedLaunchInfo(container, SteamService.getWindowsLaunchInfos(gameId))
+        } else {
+            null
+        }
+        val shouldLaunchInXr =
+            BuildConfig.XR_BUILD &&
+                !bootToContainer &&
+                XrRuntimeManager.isEnabled(context, container) &&
+                XrLaunchPreferences.shouldLaunchInVr(container, selectedSteamLaunchInfo)
+
+        if (shouldLaunchInXr) {
+            try {
+                setLoadingProgress(-1f)
+                setLoadingMessage("Preparing GameNativeVR")
+                XrPayloadManager.prepare(context, container, appId)
+            } catch (e: Exception) {
+                Timber.tag("preLaunchApp").e(e, "GameNativeVR preparation failed")
+                setLoadingDialogVisible(false)
+                setMessageDialogState(
+                    MessageDialogState(
+                        visible = true,
+                        type = DialogType.SYNC_FAIL,
+                        title = context.getString(R.string.launch_dependency_failed_title),
+                        message = e.message ?: "GameNativeVR preparation failed",
+                        dismissBtnText = context.getString(R.string.ok),
+                    ),
+                )
+                return@launch
+            }
+        } else {
+            // A previous VR launch may have installed OpenComposite beside the
+            // game. Flat mode must restore the stock OpenVR DLL before launch.
+            XrPayloadManager.restorePerGameOpenComposite(container, appId)
+        }
 
         // Migrate legacy on-disk imagefs layout (e.g. legacy Proton → shared paths) before manifest
         // installs or launch deps — resolveMissingManifestInstallRequests can install Proton too.
@@ -1588,7 +1676,36 @@ fun preLaunchApp(
         if (!bootToContainer) {
             // Verify we have a launch executable for all platforms before proceeding (fail fast, avoid black screen)
             val effectiveExe = when (gameSource) {
-                GameSource.STEAM -> SteamService.getLaunchExecutable(appId, container)
+                GameSource.STEAM -> {
+                    if (container.isLaunchRealSteam) {
+                        "steam"
+                    } else {
+                        val appDirName = SteamService.getAppDirName(SteamService.getAppInfoOf(gameId))
+                        val installedExecutable = SteamService.getInstalledExe(gameId)
+                        val resolvedExecutable = if (shouldLaunchInXr) {
+                            SteamUtils.resolveLaunchExecutablePath(
+                                File(SteamService.getAppDirPath(gameId)),
+                                appDirName,
+                                selectedSteamLaunchInfo?.executable.orEmpty(),
+                                container.executablePath,
+                                installedExecutable,
+                            )
+                        } else {
+                            SteamUtils.resolveLaunchExecutablePath(
+                                File(SteamService.getAppDirPath(gameId)),
+                                appDirName,
+                                container.executablePath,
+                                selectedSteamLaunchInfo?.executable.orEmpty(),
+                                installedExecutable,
+                            )
+                        }
+                        if (resolvedExecutable.isNotBlank() && resolvedExecutable != container.executablePath) {
+                            container.executablePath = resolvedExecutable
+                            container.saveData()
+                        }
+                        resolvedExecutable
+                    }
+                }
                 GameSource.GOG -> GOGService.getLaunchExecutable(appId, container)
                 GameSource.EPIC -> EpicService.getLaunchExecutable(appId)
                 GameSource.CUSTOM_GAME -> CustomGameScanner.getLaunchExecutable(container)

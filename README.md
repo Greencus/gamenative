@@ -38,8 +38,34 @@ It's still early. Not every game runs yet, and some need tweaking to play well, 
 - Cloud saves that carry over between your PC and your phone
 - Automatically applied known configs, so many games just work out of the box with no tweaking required
 - Controller and touch support, with a custom control editor and on-screen HUD
+- GameNativeVR support for Meta Quest, including immersive OpenXR games and a theater screen for flat games
 - Steam DLC, workshop and branch support
 - Active support over Discord if you need help getting a game running
+
+## GameNativeVR
+
+GameNativeVR adds experimental standalone PC VR support for Meta Quest headsets.
+Windows games still run locally on the headset through GameNative—there is no
+PC streaming step.
+
+- Native Windows OpenXR games render as true per-eye stereo projection layers.
+- SteamVR/OpenVR games can use the bundled per-game OpenComposite integration.
+- Flat games can run on a large room-scale theater screen.
+- Head tracking, Quest controller poses and inputs, haptics, recentering, and
+  stage bounds are bridged into the Windows game.
+- Vulkan, D3D11 through DXVK, D3D12 through vkd3d, and both 64-bit and 32-bit
+  OpenXR runtimes are wired into the GameNative Wine environment.
+
+Choose **GameNativeVR launch options** from a game's menu to select Auto,
+GameNativeVR, or Flat screen mode, select the Steam launch entry, add VR
+arguments, and enable OpenComposite.
+
+GameNativeVR currently requires a Meta Quest in Developer Mode and an XR build
+of the app. The software implementation and Wine/VM tests are complete, while
+the final headset compatibility matrix remains experimental. See the
+[implementation status](docs/xr/implementation-status.md) and
+[Quest test checklist](docs/xr/quest-final-test.md) for current validation
+details.
 
 ## Demo
 

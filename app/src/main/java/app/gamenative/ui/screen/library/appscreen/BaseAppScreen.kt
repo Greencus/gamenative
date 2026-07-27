@@ -1309,7 +1309,13 @@ abstract class BaseAppScreen {
         }
 
         // Render any additional dialogs
-        AdditionalDialogs(libraryItem, onDismiss = {}, onEditContainer = onEditContainer, onBack = onBack)
+        AdditionalDialogs(
+            libraryItem = libraryItem,
+            onDismiss = {},
+            onEditContainer = onEditContainer,
+            onBack = onBack,
+            onClickPlay = onClickPlay,
+        )
     }
 
     /**
@@ -1341,6 +1347,7 @@ abstract class BaseAppScreen {
         onDismiss: () -> Unit,
         onEditContainer: () -> Unit,
         onBack: () -> Unit,
+        onClickPlay: (Boolean) -> Unit,
     ) {
         // Default: no additional dialogs
     }

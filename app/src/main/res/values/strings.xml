@@ -1,5 +1,6 @@
 ﻿<resources>
     <string name="app_name">GameNative</string>
+    <string name="gamenative_vr_name">GameNativeVR</string>
     <string name="login_user">User Login</string>
     <string name="login_2fa">Two Factor</string>
     <string name="home">Home</string>
@@ -1522,6 +1523,7 @@
     <string name="option_test_graphics">Test graphics</string>
     <string name="option_manage_dlc">Manage DLC</string>
     <string name="option_manage_workshop">Manage Workshop</string>
+    <string name="option_vr_launch_options">GameNativeVR launch options</string>
     <!-- Recommendations -->
     <string name="recommended_badge">Recommended</string>
     <string name="recommended_buy_button">Check It Out</string>

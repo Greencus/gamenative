@@ -1,0 +1,4 @@
+LIBRARY gamenative_openxr64.dll
+EXPORTS
+    xrGetInstanceProcAddr
+    xrNegotiateLoaderRuntimeInterface

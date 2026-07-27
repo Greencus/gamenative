@@ -1,0 +1,62 @@
+diff --git a/dlls/winevulkan/vulkan.c b/dlls/winevulkan/vulkan.c
+index 688d1fbeab6..5fd6dd5b9d1 100644
+--- a/dlls/winevulkan/vulkan.c
++++ b/dlls/winevulkan/vulkan.c
+@@ -430 +430,57 @@ static VkResult wine_vk_device_convert_create_info(struct wine_phys_dev *phys_de
++    /*
++     * GameNative's OpenXR unixlib exports the application's render images as
++     * dma-buf and sync-file FDs. Those are host-only Vulkan extensions:
++     * winevulkan must not advertise them to the Windows application, but its
++     * host VkDevice must enable them so the unixlib can use the native entry
++     * points. Scope the interop to XR launches to leave ordinary Wine Vulkan
++     * applications untouched.
++     */
++    if (getenv("GAMENATIVE_XR"))
++    {
++        static const char *xr_host_extensions[] =
++        {
++            "VK_KHR_external_memory",
++            "VK_KHR_external_memory_fd",
++            "VK_EXT_external_memory_dma_buf",
++            "VK_EXT_image_drm_format_modifier",
++            "VK_KHR_external_fence",
++            "VK_KHR_external_fence_fd",
++        };
++        VkExtensionProperties *host_extensions = NULL;
++        const char **new_extensions;
++        uint32_t host_extension_count = 0;
++        unsigned int j, k, count = dst->enabledExtensionCount;
++
++        new_extensions = conversion_context_alloc(ctx, (count + ARRAY_SIZE(xr_host_extensions)) *
++                                                  sizeof(*dst->ppEnabledExtensionNames));
++        memcpy(new_extensions, dst->ppEnabledExtensionNames,
++               count * sizeof(*dst->ppEnabledExtensionNames));
++        if (phys_dev->instance->funcs.p_vkEnumerateDeviceExtensionProperties(
++                phys_dev->host_physical_device, NULL, &host_extension_count, NULL) == VK_SUCCESS &&
++            host_extension_count)
++        {
++            host_extensions = conversion_context_alloc(ctx, host_extension_count *
++                                                        sizeof(*host_extensions));
++            if (phys_dev->instance->funcs.p_vkEnumerateDeviceExtensionProperties(
++                    phys_dev->host_physical_device, NULL, &host_extension_count,
++                    host_extensions) != VK_SUCCESS)
++                host_extension_count = 0;
++        }
++        for (i = 0; i < ARRAY_SIZE(xr_host_extensions); ++i)
++        {
++            for (k = 0; k < host_extension_count; ++k)
++                if (!strcmp(host_extensions[k].extensionName, xr_host_extensions[i])) break;
++            if (k == host_extension_count)
++            {
++                TRACE("GameNative XR host extension %s is unavailable.\n", xr_host_extensions[i]);
++                continue;
++            }
++            for (j = 0; j < count; ++j)
++                if (!strcmp(new_extensions[j], xr_host_extensions[i])) break;
++            if (j == count) new_extensions[count++] = xr_host_extensions[i];
++        }
++        dst->enabledExtensionCount = count;
++        dst->ppEnabledExtensionNames = new_extensions;
++    }
++
+     return VK_SUCCESS;

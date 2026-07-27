@@ -3,6 +3,7 @@ package com.winlator.widget;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.view.SurfaceHolder;
+import android.view.SurfaceControl;
 import android.view.SurfaceView;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -35,6 +36,11 @@ public class XServerView extends SurfaceView implements SurfaceHolder.Callback, 
 
     public VulkanRenderer getRenderer() {
         return renderer;
+    }
+
+    @Override
+    public SurfaceControl getRendererSurfaceControl() {
+        return getSurfaceControl();
     }
 
     @Override
