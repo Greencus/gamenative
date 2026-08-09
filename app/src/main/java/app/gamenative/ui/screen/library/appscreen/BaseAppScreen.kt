@@ -764,7 +764,7 @@ abstract class BaseAppScreen {
                             )
                             if (forced != null && forced.isNotEmpty()) {
                                 val c = ContainerUtils.getOrCreateContainer(context, appId)
-                                val cd = ContainerUtils.toContainerData(c)
+                                val cd = ContainerUtils.toContainerData(context, c)
                                 val updated = ContainerUtils.applyBestConfigMapToContainerData(cd, forced)
                                 ContainerUtils.applyToContainer(context, c, updated)
                                 SnackbarManager.show(context.getString(R.string.best_config_applied_with_defaults))
@@ -779,7 +779,7 @@ abstract class BaseAppScreen {
                 }
             } else if (parsedConfig != null && parsedConfig.isNotEmpty()) {
                 val container = ContainerUtils.getOrCreateContainer(context, appId)
-                val currentData = ContainerUtils.toContainerData(container)
+                val currentData = ContainerUtils.toContainerData(context, container)
                 val updatedData = ContainerUtils.applyBestConfigMapToContainerData(
                     currentData,
                     parsedConfig,
@@ -1244,6 +1244,9 @@ abstract class BaseAppScreen {
                 onSave = {
                     saveContainerConfig(context, libraryItem, it)
                     showConfigDialog = false
+                },
+                onVrConfigChanged = {
+                    ContainerUtils.applyXrSettings(context, libraryItem.appId, it)
                 },
             )
         }

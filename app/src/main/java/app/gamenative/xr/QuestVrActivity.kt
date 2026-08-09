@@ -59,6 +59,7 @@ class QuestVrActivity : ComponentActivity() {
     private val bridgeServer = XrBridgeServer()
     @Volatile private var pendingBridgeMilestone: String? = null
     @Volatile private var launchFailurePending: Boolean = false
+    private var xrContainerSettings = XrContainerSettings.Values()
 
     override fun attachBaseContext(newBase: Context) {
         PrefManager.init(newBase)
@@ -100,6 +101,49 @@ class QuestVrActivity : ComponentActivity() {
             "VR activity created; executable=${resolvedExecutable.ifBlank { "<container default>" }} " +
                 "arguments=${launchInfoOverride?.arguments.orEmpty().ifBlank { "<none>" }}",
         )
+        xrContainerSettings = runCatching {
+            val container = ContainerUtils.getContainer(applicationContext, appId)
+            val persisted = XrContainerSettings.read(applicationContext, appId, container)
+            persisted.copy(
+                renderScale = if (intent.hasExtra(QuestVrLauncher.EXTRA_RENDER_SCALE)) {
+                    XrContainerSettings.sanitizeRenderScale(
+                        intent.getIntExtra(QuestVrLauncher.EXTRA_RENDER_SCALE, persisted.renderScale),
+                    )
+                } else {
+                    persisted.renderScale
+                },
+                openCompositeEnabled = if (intent.hasExtra(QuestVrLauncher.EXTRA_OPENCOMPOSITE)) {
+                    intent.getBooleanExtra(
+                        QuestVrLauncher.EXTRA_OPENCOMPOSITE,
+                        persisted.openCompositeEnabled,
+                    )
+                } else {
+                    persisted.openCompositeEnabled
+                },
+                theaterScreenEnabled = if (intent.hasExtra(QuestVrLauncher.EXTRA_THEATER_SCREEN)) {
+                    intent.getBooleanExtra(
+                        QuestVrLauncher.EXTRA_THEATER_SCREEN,
+                        persisted.theaterScreenEnabled,
+                    )
+                } else {
+                    persisted.theaterScreenEnabled
+                },
+                clockEnabled = if (intent.hasExtra(QuestVrLauncher.EXTRA_CLOCK)) {
+                    intent.getBooleanExtra(QuestVrLauncher.EXTRA_CLOCK, persisted.clockEnabled)
+                } else {
+                    persisted.clockEnabled
+                },
+            )
+        }.onFailure { error ->
+            Timber.w(error, "Could not read per-container VR settings; using defaults")
+        }.getOrDefault(XrContainerSettings.Values())
+        val settingsSummary =
+            "renderScale=${xrContainerSettings.renderScale}% " +
+                "openComposite=${xrContainerSettings.openCompositeEnabled} " +
+                "theater=${xrContainerSettings.theaterScreenEnabled} " +
+                "clock=${xrContainerSettings.clockEnabled}"
+        Timber.i("GameNativeVR container settings: $settingsSummary")
+        XrLaunchDiagnostics.record(this, "VR container settings: $settingsSummary")
         bridgeServer.onHaptic = { hand, amplitude, durationNs, frequency ->
             val handle = nativeXrHandle
             if (handle != 0L) {
@@ -116,7 +160,13 @@ class QuestVrActivity : ComponentActivity() {
         }
         bridgeServer.start()
         var startupError: String? = null
-        nativeXrHandle = runCatching { nativeStart() }
+        nativeXrHandle = runCatching {
+            nativeStart(
+                renderScale = xrContainerSettings.renderScale,
+                theaterScreenEnabled = xrContainerSettings.theaterScreenEnabled,
+                clockEnabled = xrContainerSettings.clockEnabled,
+            )
+        }
             .onFailure { error ->
                 Timber.e(error, "GameNativeVR native startup failed")
                 XrLaunchDiagnostics.record(this, "Native XR startup failed: ${error.message}", error)
@@ -294,7 +344,7 @@ class QuestVrActivity : ComponentActivity() {
         Timber.i("GameNativeVR activity overlay ready")
         XrLaunchDiagnostics.record(
             this,
-            "XR activity overlay ready: 15 cm hand cubes and left-hand clock",
+            "XR activity overlay ready: left-hand clock",
         )
     }
 
@@ -449,7 +499,11 @@ class QuestVrActivity : ComponentActivity() {
         }
     }
 
-    private external fun nativeStart(): Long
+    private external fun nativeStart(
+        renderScale: Int,
+        theaterScreenEnabled: Boolean,
+        clockEnabled: Boolean,
+    ): Long
     private external fun nativeStop(handle: Long)
     private external fun nativeHaptic(handle: Long, hand: Int, amplitude: Float, durationNs: Long, frequency: Float)
     private external fun nativeRequestExit(handle: Long)

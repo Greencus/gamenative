@@ -15,7 +15,6 @@ import timber.log.Timber
 
 object XrRuntimeManager {
     private const val ENABLED_EXTRA = "xrRuntimeEnabled"
-    private const val OPENCOMPOSITE_EXTRA = "xrOpenCompositeEnabled"
     private const val WINDOWS_XR_DIR = "C:\\gamenative\\xr"
     private const val RUNTIME_JSON_COMMON = "gamenative_openxr.json"
     private const val RUNTIME_JSON_64 = "gamenative_openxr64.json"
@@ -38,11 +37,17 @@ object XrRuntimeManager {
             MainActivity.isHeadset(context) &&
             container.getExtra(ENABLED_EXTRA, "true").toBooleanStrictOrNull() != false
 
-    fun isOpenCompositeEnabled(container: Container): Boolean =
-        container.getExtra(OPENCOMPOSITE_EXTRA, "true").toBooleanStrictOrNull() != false
+    fun isOpenCompositeEnabled(context: Context, container: Container): Boolean =
+        XrContainerSettings.read(context, container.id, container).openCompositeEnabled
 
-    fun setOpenCompositeEnabled(container: Container, enabled: Boolean) {
-        container.putExtra(OPENCOMPOSITE_EXTRA, enabled)
+    fun setOpenCompositeEnabled(context: Context, container: Container, enabled: Boolean) {
+        val updated = XrContainerSettings.read(context, container.id, container).copy(
+            openCompositeEnabled = enabled,
+        )
+        check(XrContainerSettings.persist(context, container.id, updated)) {
+            "Could not persist OpenComposite setting for ${container.id}"
+        }
+        XrContainerSettings.write(container, updated)
         container.saveData()
     }
 
@@ -104,7 +109,7 @@ object XrRuntimeManager {
             "WINEDLLOVERRIDES",
             runtimeDllOverrides(envVars.get("WINEDLLOVERRIDES")),
         )
-        if (isOpenCompositeEnabled(container)) {
+        if (isOpenCompositeEnabled(context, container)) {
             val openCompositeDir = File(container.rootDir, ".wine/drive_c/gamenative/opencomposite")
             if (openCompositeDir.isDirectory) {
                 envVars.put("VR_OVERRIDE", openCompositeDir.absolutePath)

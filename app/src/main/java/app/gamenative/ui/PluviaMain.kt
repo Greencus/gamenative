@@ -1200,7 +1200,7 @@ fun PluviaMain(
                 }
                 containerConfigForDialog = withContext(Dispatchers.IO) {
                     val container = ContainerUtils.getOrCreateContainer(context, appId)
-                    ContainerUtils.toContainerData(container)
+                    ContainerUtils.toContainerData(context, container)
                 }
             }
             openContainerConfigForAppId?.let { appId ->
@@ -1217,6 +1217,9 @@ fun PluviaMain(
                                 }
                                 openContainerConfigForAppId = null
                             }
+                        },
+                        onVrConfigChanged = { newConfig ->
+                            ContainerUtils.applyXrSettings(context, appId, newConfig)
                         },
                     )
                 }

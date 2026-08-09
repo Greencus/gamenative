@@ -11,6 +11,8 @@
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <sys/system_properties.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <unistd.h>
 #include <jni.h>
@@ -44,103 +46,22 @@
 
 namespace {
 constexpr XrViewConfigurationType kViewType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-constexpr float kHandCubeSizeMeters = 0.15f;
+constexpr uint32_t kDrmFormatAbgr8888 =
+    static_cast<uint32_t>('A') | (static_cast<uint32_t>('B') << 8) |
+    (static_cast<uint32_t>('2') << 16) | (static_cast<uint32_t>('4') << 24);
+constexpr uint32_t kDrmFormatArgb8888 =
+    static_cast<uint32_t>('A') | (static_cast<uint32_t>('R') << 8) |
+    (static_cast<uint32_t>('2') << 16) | (static_cast<uint32_t>('4') << 24);
 
-struct Mat4 {
-    float m[16]{};
+struct DmaBufSync {
+    uint64_t flags;
 };
 
-Mat4 identityMatrix() {
-    Mat4 result{};
-    result.m[0] = result.m[5] = result.m[10] = result.m[15] = 1.0f;
-    return result;
-}
-
-Mat4 multiply(const Mat4& a, const Mat4& b) {
-    Mat4 result{};
-    for (int column = 0; column < 4; ++column) {
-        for (int row = 0; row < 4; ++row) {
-            for (int k = 0; k < 4; ++k) {
-                result.m[column * 4 + row] +=
-                    a.m[k * 4 + row] * b.m[column * 4 + k];
-            }
-        }
-    }
-    return result;
-}
-
-Mat4 rotationMatrix(const XrQuaternionf& q) {
-    const float xx = q.x * q.x;
-    const float yy = q.y * q.y;
-    const float zz = q.z * q.z;
-    const float xy = q.x * q.y;
-    const float xz = q.x * q.z;
-    const float yz = q.y * q.z;
-    const float wx = q.w * q.x;
-    const float wy = q.w * q.y;
-    const float wz = q.w * q.z;
-    Mat4 result = identityMatrix();
-    result.m[0] = 1.0f - 2.0f * (yy + zz);
-    result.m[1] = 2.0f * (xy + wz);
-    result.m[2] = 2.0f * (xz - wy);
-    result.m[4] = 2.0f * (xy - wz);
-    result.m[5] = 1.0f - 2.0f * (xx + zz);
-    result.m[6] = 2.0f * (yz + wx);
-    result.m[8] = 2.0f * (xz + wy);
-    result.m[9] = 2.0f * (yz - wx);
-    result.m[10] = 1.0f - 2.0f * (xx + yy);
-    return result;
-}
-
-Mat4 poseMatrix(const XrPosef& pose) {
-    Mat4 result = rotationMatrix(pose.orientation);
-    result.m[12] = pose.position.x;
-    result.m[13] = pose.position.y;
-    result.m[14] = pose.position.z;
-    return result;
-}
-
-Mat4 inversePoseMatrix(const XrPosef& pose) {
-    XrQuaternionf inverseRotation{
-        -pose.orientation.x,
-        -pose.orientation.y,
-        -pose.orientation.z,
-        pose.orientation.w,
-    };
-    Mat4 rotation = rotationMatrix(inverseRotation);
-    Mat4 translation = identityMatrix();
-    translation.m[12] = -pose.position.x;
-    translation.m[13] = -pose.position.y;
-    translation.m[14] = -pose.position.z;
-    return multiply(rotation, translation);
-}
-
-Mat4 scaleMatrix(float x, float y, float z) {
-    Mat4 result{};
-    result.m[0] = x;
-    result.m[5] = y;
-    result.m[10] = z;
-    result.m[15] = 1.0f;
-    return result;
-}
-
-Mat4 projectionMatrix(const XrFovf& fov, float nearZ = 0.03f, float farZ = 100.0f) {
-    const float left = std::tan(fov.angleLeft);
-    const float right = std::tan(fov.angleRight);
-    const float down = std::tan(fov.angleDown);
-    const float up = std::tan(fov.angleUp);
-    const float width = right - left;
-    const float height = up - down;
-    Mat4 result{};
-    result.m[0] = 2.0f / width;
-    result.m[5] = 2.0f / height;
-    result.m[8] = (right + left) / width;
-    result.m[9] = (up + down) / height;
-    result.m[10] = -(farZ + nearZ) / (farZ - nearZ);
-    result.m[11] = -1.0f;
-    result.m[14] = -(2.0f * farZ * nearZ) / (farZ - nearZ);
-    return result;
-}
+constexpr uint64_t kDmaBufSyncRead = 1u << 0;
+constexpr uint64_t kDmaBufSyncEnd = 1u << 2;
+#ifndef DMA_BUF_IOCTL_SYNC
+#define DMA_BUF_IOCTL_SYNC _IOW('b', 0, DmaBufSync)
+#endif
 
 bool xrFailed(XrResult result, const char* call) {
     if (XR_FAILED(result)) {
@@ -194,8 +115,17 @@ struct PendingHaptic {
 
 class QuestXrApp {
 public:
-    QuestXrApp(JavaVM* vm, jobject activity)
-        : javaVm(vm), activityRef(activity) {}
+    QuestXrApp(
+        JavaVM* vm,
+        jobject activity,
+        int renderScalePercent,
+        bool theaterScreenEnabled,
+        bool clockEnabled)
+        : javaVm(vm),
+          activityRef(activity),
+          renderScalePercent(std::clamp(renderScalePercent, 50, 150)),
+          theaterScreenEnabled(theaterScreenEnabled),
+          clockEnabled(clockEnabled) {}
 
     ~QuestXrApp() {
         stop();
@@ -234,6 +164,9 @@ private:
     std::atomic<bool> running{false};
     std::atomic<bool> exitRequested{false};
     std::thread renderThread;
+    int renderScalePercent{100};
+    bool theaterScreenEnabled{true};
+    bool clockEnabled{true};
 
     EGLDisplay eglDisplay{EGL_NO_DISPLAY};
     EGLConfig eglConfig{nullptr};
@@ -243,6 +176,8 @@ private:
     GLuint externalTexture{0};
     GLuint blitProgram{0};
     GLuint blitVbo{0};
+    GLuint blitVao{0};
+    GLint blitTextureUniform{-1};
     jobject surfaceTextureRef{nullptr};
     jmethodID surfaceTextureUpdateTexImage{nullptr};
     jmethodID activityFrameStateMethod{nullptr};
@@ -265,9 +200,10 @@ private:
 
     std::vector<XrViewConfigurationView> configViews;
     std::vector<XrView> views;
+    std::vector<XrCompositionLayerProjectionView> compositionViews;
     std::vector<EyeSwapchain> eyeSwapchains;
-    std::vector<EyeSwapchain> overlaySwapchains;
     ScreenSwapchain screenSwapchain;
+    ScreenSwapchain clockSwapchain{XR_NULL_HANDLE, 384, 160, {}};
 
     // Zero-copy eye-buffer transport: the Wine producer ships per-eye AHardwareBuffers
     // (the game's actual swapchain images) over an AF_UNIX socket. We import each into a
@@ -298,18 +234,32 @@ private:
 
     GLuint blit2DProgram{0};
     GLuint blit2DVbo{0};
+    GLuint blit2DVao{0};
+    GLint blit2DTextureUniform{-1};
+    GLint blit2DUvTransformUniform{-1};
     GLuint overlayProgram{0};
     GLuint overlayVbo{0};
-    GLuint overlayDepthBuffer{0};
-    GLint overlayMvpUniform{-1};
     GLint overlayColorUniform{-1};
     bool overlayReady{false};
+    int64_t renderedClockMinute{-1};
     GLuint eyeTextures[gamenative::xr::FrameTransport::kEyeCount]
                       [gamenative::xr::FrameTransport::kMaxImages]{};
     EGLImageKHR eyeImages[gamenative::xr::FrameTransport::kEyeCount]
                           [gamenative::xr::FrameTransport::kMaxImages]{};
     uint64_t eyeImportedRegistration[gamenative::xr::FrameTransport::kEyeCount]
                                     [gamenative::xr::FrameTransport::kMaxImages]{};
+    bool eyeDmaBufCpuFallback[gamenative::xr::FrameTransport::kEyeCount]
+                              [gamenative::xr::FrameTransport::kMaxImages]{};
+    int eyeCpuTextureWidth[gamenative::xr::FrameTransport::kEyeCount]
+                          [gamenative::xr::FrameTransport::kMaxImages]{};
+    int eyeCpuTextureHeight[gamenative::xr::FrameTransport::kEyeCount]
+                           [gamenative::xr::FrameTransport::kMaxImages]{};
+    void* eyeCpuMappings[gamenative::xr::FrameTransport::kEyeCount]
+                        [gamenative::xr::FrameTransport::kMaxImages]{};
+    size_t eyeCpuMappingLengths[gamenative::xr::FrameTransport::kEyeCount]
+                               [gamenative::xr::FrameTransport::kMaxImages]{};
+    uint64_t eyeCpuMappingRegistrations[gamenative::xr::FrameTransport::kEyeCount]
+                                       [gamenative::xr::FrameTransport::kMaxImages]{};
     uint64_t eyeRenderedSerial[2]{0, 0};
     bool stereoResourcesReady{false};
     bool stereoProjectionAnnounced{false};
@@ -363,22 +313,27 @@ private:
             LOGW("Controller input unavailable; games will see inactive actions");
         }
 
-        const bool screenReady = createScreenSwapchain(env);
-        if (!screenReady) {
-            LOGW("OpenXR texture screen unavailable; relying on per-eye projection path");
-        }
+        // The SurfaceTexture is required by the Wine/X11 display even when its optional
+        // theater layer is disabled. Avoid allocating the separate 1080p OpenXR swapchain
+        // and shader resources in that case.
+        const bool screenReady = theaterScreenEnabled
+            ? createScreenSwapchain(env)
+            : createExternalTextureSurface(env);
+        if (!screenReady) LOGW("OpenXR texture surface unavailable");
         // Eye swapchains back both the legacy placeholder and the new stereo path, so
         // create them whenever they don't already exist.
         if (eyeSwapchains.empty() && !createEyeSwapchains()) {
-            if (!screenReady) return false;  // no usable presentation path at all
+            if (!theaterScreenEnabled || screenSwapchain.swapchain == XR_NULL_HANDLE) {
+                return false;  // no usable presentation path at all
+            }
         }
         glGenFramebuffers(1, &framebuffer);
 
-        if (createOverlaySwapchains() && createOverlayResources()) {
+        if (clockEnabled && createClockSwapchain() && createOverlayResources()) {
             overlayReady = true;
-            LOGI("XR activity overlay ready: 15 cm hand cubes and left-hand clock");
+            LOGI("XR activity overlay ready: compositor clock quad");
             publishOverlayReady(env);
-        } else {
+        } else if (clockEnabled) {
             LOGW("XR activity overlay unavailable; base XR presentation remains active");
         }
 
@@ -464,11 +419,27 @@ private:
 
     void publishViewConfig(JNIEnv* env) {
         if (activityViewConfigMethod == nullptr || configViews.empty()) return;
+        const auto& view = configViews[0];
+        const uint32_t width = std::min(
+            view.maxImageRectWidth,
+            static_cast<uint32_t>(std::lround(
+                view.recommendedImageRectWidth * renderScalePercent / 100.0)));
+        const uint32_t height = std::min(
+            view.maxImageRectHeight,
+            static_cast<uint32_t>(std::lround(
+                view.recommendedImageRectHeight * renderScalePercent / 100.0)));
+        LOGI(
+            "Game render resolution scale=%d%% recommended=%ux%u requested=%ux%u",
+            renderScalePercent,
+            view.recommendedImageRectWidth,
+            view.recommendedImageRectHeight,
+            width,
+            height);
         env->CallVoidMethod(
             activityRef,
             activityViewConfigMethod,
-            static_cast<jint>(configViews[0].recommendedImageRectWidth),
-            static_cast<jint>(configViews[0].recommendedImageRectHeight));
+            static_cast<jint>(width),
+            static_cast<jint>(height));
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
@@ -624,6 +595,9 @@ private:
         configViews.assign(viewCount, XrViewConfigurationView{XR_TYPE_VIEW_CONFIGURATION_VIEW});
         XR_CHECK(xrEnumerateViewConfigurationViews(instance, systemId, kViewType, viewCount, &viewCount, configViews.data()));
         views.assign(viewCount, XrView{XR_TYPE_VIEW});
+        compositionViews.assign(
+            viewCount,
+            XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         PFN_xrGetOpenGLESGraphicsRequirementsKHR getRequirements = nullptr;
         XR_CHECK(xrGetInstanceProcAddr(
@@ -1063,6 +1037,7 @@ void main() {
             blitProgram = 0;
             return false;
         }
+        blitTextureUniform = glGetUniformLocation(blitProgram, "uTexture");
 
         const float vertices[] = {
             -1.0f, -1.0f, 0.0f, 1.0f,
@@ -1073,7 +1048,17 @@ void main() {
         glGenBuffers(1, &blitVbo);
         glBindBuffer(GL_ARRAY_BUFFER, blitVbo);
         glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        glGenVertexArrays(1, &blitVao);
+        glBindVertexArray(blitVao);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
+        glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(blitProgram);
+        glUniform1i(blitTextureUniform, 0);
+        glUseProgram(0);
         return true;
     }
 
@@ -1122,6 +1107,8 @@ void main() {
             blit2DProgram = 0;
             return false;
         }
+        blit2DTextureUniform = glGetUniformLocation(blit2DProgram, "uTexture");
+        blit2DUvTransformUniform = glGetUniformLocation(blit2DProgram, "uUvTransform");
 
         const float vertices[] = {
             -1.0f, -1.0f, 0.0f, 1.0f,
@@ -1132,7 +1119,17 @@ void main() {
         glGenBuffers(1, &blit2DVbo);
         glBindBuffer(GL_ARRAY_BUFFER, blit2DVbo);
         glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        glGenVertexArrays(1, &blit2DVao);
+        glBindVertexArray(blit2DVao);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
+        glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(blit2DProgram);
+        glUniform1i(blit2DTextureUniform, 0);
+        glUseProgram(0);
         stereoResourcesReady = true;
         return true;
     }
@@ -1254,6 +1251,108 @@ void main() {
         return fd;
     }
 
+    bool uploadLinearDmabufToTexture(
+        int eye, int imageIndex, const gamenative::xr::EyeFrame& frame,
+        GLuint& texture, uint64_t& cachedRegistration) {
+        if (frame.planeCount != 1 || frame.dmabufFds[0] < 0 ||
+            frame.modifier != 0 || frame.width <= 0 || frame.height <= 0 ||
+            frame.strides[0] < static_cast<uint32_t>(frame.width) * 4u ||
+            (frame.fourcc != kDrmFormatAbgr8888 &&
+             frame.fourcc != kDrmFormatArgb8888)) {
+            LOGE("CPU dma-buf fallback does not support eye=%d fourcc=0x%08x "
+                 "planes=%d modifier=0x%llx stride=%u",
+                 eye, frame.fourcc, frame.planeCount,
+                 static_cast<unsigned long long>(frame.modifier), frame.strides[0]);
+            return false;
+        }
+
+        const size_t rowBytes = static_cast<size_t>(frame.width) * 4u;
+        const size_t mapLength = static_cast<size_t>(frame.offsets[0]) +
+            static_cast<size_t>(frame.strides[0]) *
+                static_cast<size_t>(frame.height - 1) + rowBytes;
+        if (mapLength < rowBytes) return false;
+
+        void*& mapping = eyeCpuMappings[eye][imageIndex];
+        size_t& mappedLength = eyeCpuMappingLengths[eye][imageIndex];
+        uint64_t& mappedRegistration = eyeCpuMappingRegistrations[eye][imageIndex];
+        if (mapping != nullptr &&
+            (mappedRegistration != frame.registrationSerial || mappedLength < mapLength)) {
+            ::munmap(mapping, mappedLength);
+            mapping = nullptr;
+            mappedLength = 0;
+            mappedRegistration = 0;
+        }
+        if (mapping == nullptr) {
+            mapping = ::mmap(
+                nullptr, mapLength, PROT_READ, MAP_SHARED, frame.dmabufFds[0], 0);
+            if (mapping == MAP_FAILED) {
+                mapping = nullptr;
+                LOGE("CPU dma-buf mmap failed eye=%d length=%zu offset=%u: %s",
+                     eye, mapLength, frame.offsets[0], strerror(errno));
+                return false;
+            }
+            mappedLength = mapLength;
+            mappedRegistration = frame.registrationSerial;
+        }
+
+        if (texture == 0) glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        while (glGetError() != GL_NO_ERROR) {}
+        const bool allocate =
+            eyeCpuTextureWidth[eye][imageIndex] != frame.width ||
+            eyeCpuTextureHeight[eye][imageIndex] != frame.height ||
+            cachedRegistration != frame.registrationSerial;
+        if (allocate) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            // ARGB8888 is byte-ordered BGRA on little-endian Android. Let the texture
+            // sampler exchange red and blue instead of converting every pixel on the CPU.
+            const bool swapRedBlue = frame.fourcc == kDrmFormatArgb8888;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R,
+                            swapRedBlue ? GL_BLUE : GL_RED);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B,
+                            swapRedBlue ? GL_RED : GL_BLUE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frame.width, frame.height,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        }
+
+        DmaBufSync sync{kDmaBufSyncRead};
+        if (::ioctl(frame.dmabufFds[0], DMA_BUF_IOCTL_SYNC, &sync) != 0 &&
+            errno != ENOTTY && errno != EINVAL) {
+            LOGW("DMA_BUF_IOCTL_SYNC start failed eye=%d: %s", eye, strerror(errno));
+        }
+        const auto* sourceBase = static_cast<const uint8_t*>(mapping) + frame.offsets[0];
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(frame.strides[0] / 4u));
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height,
+                        GL_RGBA, GL_UNSIGNED_BYTE, sourceBase);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        const GLenum uploadError = glGetError();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        sync.flags = kDmaBufSyncRead | kDmaBufSyncEnd;
+        if (::ioctl(frame.dmabufFds[0], DMA_BUF_IOCTL_SYNC, &sync) != 0 &&
+            errno != ENOTTY && errno != EINVAL) {
+            LOGW("DMA_BUF_IOCTL_SYNC end failed eye=%d: %s", eye, strerror(errno));
+        }
+        if (uploadError != GL_NO_ERROR) {
+            LOGE("CPU dma-buf texture upload failed eye=%d index=%d error=0x%x",
+                 eye, imageIndex, uploadError);
+            return false;
+        }
+        if (allocate) {
+            LOGI("Direct mapped dma-buf fallback active eye=%d index=%d size=%dx%d fourcc=0x%08x",
+                 eye, imageIndex, frame.width, frame.height, frame.fourcc);
+        }
+        eyeCpuTextureWidth[eye][imageIndex] = frame.width;
+        eyeCpuTextureHeight[eye][imageIndex] = frame.height;
+        cachedRegistration = frame.registrationSerial;
+        return true;
+    }
+
     bool importEyeBuffer(int eye, gamenative::xr::EyeFrame& frame, bool& freshFrame) {
         frame = frameTransport.pollEye(eye);
         if (frame.kind == gamenative::xr::BufferKind::None) return false;
@@ -1287,6 +1386,11 @@ void main() {
             return true;  // same registered buffer, newly synchronized contents
         }
 
+        if (eyeDmaBufCpuFallback[eye][imageIndex] &&
+            frame.registrationSerial == cachedRegistration && !freshFrame) {
+            return cachedTexture != 0;
+        }
+
         if (cachedImage != EGL_NO_IMAGE_KHR) {
             eglDestroyImageKHR(eglDisplay, cachedImage);
             cachedImage = EGL_NO_IMAGE_KHR;
@@ -1297,9 +1401,20 @@ void main() {
             image = createImageFromHardwareBuffer(frame.buffer);
         } else if (frame.kind == gamenative::xr::BufferKind::DmaBuf &&
                    frame.planeCount > 0 && frame.dmabufFds[0] >= 0) {
-            image = createImageFromDmabuf(frame);
+            if (!eyeDmaBufCpuFallback[eye][imageIndex]) {
+                image = createImageFromDmabuf(frame);
+                if (image == EGL_NO_IMAGE_KHR) {
+                    eyeDmaBufCpuFallback[eye][imageIndex] = true;
+                }
+            }
         }
         if (image == EGL_NO_IMAGE_KHR) {
+            if (frame.kind == gamenative::xr::BufferKind::DmaBuf &&
+                eyeDmaBufCpuFallback[eye][imageIndex] &&
+                uploadLinearDmabufToTexture(
+                    eye, imageIndex, frame, cachedTexture, cachedRegistration)) {
+                return true;
+            }
             LOGE("eglCreateImageKHR failed for eye %d (kind=%d)", eye, static_cast<int>(frame.kind));
             frameTransport.discardFrame(
                 eye, frame.imageIndex, frame.serial);
@@ -1336,18 +1451,13 @@ void main() {
 
     void blit2DTexture(GLuint texture, int width, int height,
                        const gamenative::xr::EyeFrame& source) {
-        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glViewport(0, 0, width, height);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glDisable(GL_SCISSOR_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
         glUseProgram(blit2DProgram);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
-        glUniform1i(glGetUniformLocation(blit2DProgram, "uTexture"), 0);
         const float sourceWidth = source.sourceWidth > 0
             ? static_cast<float>(source.sourceWidth)
             : static_cast<float>(source.width);
@@ -1355,20 +1465,14 @@ void main() {
             ? static_cast<float>(source.sourceHeight)
             : static_cast<float>(source.height);
         glUniform4f(
-            glGetUniformLocation(blit2DProgram, "uUvTransform"),
+            blit2DUvTransformUniform,
             static_cast<float>(source.sourceX) / static_cast<float>(source.width),
             static_cast<float>(source.sourceY) / static_cast<float>(source.height),
             sourceWidth / static_cast<float>(source.width),
             sourceHeight / static_cast<float>(source.height));
-        glBindBuffer(GL_ARRAY_BUFFER, blit2DVbo);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(0));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
+        glBindVertexArray(blit2DVao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
     }
@@ -1376,29 +1480,18 @@ void main() {
     // True per-eye stereo: import each eye's game-rendered AHardwareBuffer and blit it into
     // the matching Quest eye swapchain, then submit a projection layer. Returns false when
     // stereo content isn't ready, so the caller can fall back to the legacy path.
-    bool renderStereoProjection(const XrFrameState& frameState,
-                                std::vector<XrCompositionLayerProjectionView>& projectionViews,
+    bool renderStereoProjection(uint32_t viewCount,
                                 XrCompositionLayerProjection& projectionLayer,
                                 const XrCompositionLayerBaseHeader*& submittedLayer) {
         if (!stereoResourcesReady || !frameTransport.hasStereoContent() || eyeSwapchains.empty()) {
             return false;
         }
 
-        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.viewConfigurationType = kViewType;
-        locateInfo.displayTime = frameState.predictedDisplayTime;
-        locateInfo.space = appSpace;
-
-        XrViewState viewState{XR_TYPE_VIEW_STATE};
-        uint32_t viewCount = static_cast<uint32_t>(views.size());
-        XrResult locateResult = xrLocateViews(session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
-        if (XR_FAILED(locateResult) || (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
-            return false;
-        }
         if (viewCount > eyeSwapchains.size()) viewCount = static_cast<uint32_t>(eyeSwapchains.size());
 
-        projectionViews.assign(viewCount, XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
         for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            compositionViews[eye] = {
+                XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
             auto& swapchain = eyeSwapchains[eye];
             gamenative::xr::EyeFrame sourceFrame;
             bool freshFrame = false;
@@ -1451,35 +1544,35 @@ void main() {
             xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
 
             if (sourceFrame.projectionValid) {
-                projectionViews[eye].pose.orientation = {
+                compositionViews[eye].pose.orientation = {
                     sourceFrame.projectionOrientation[0],
                     sourceFrame.projectionOrientation[1],
                     sourceFrame.projectionOrientation[2],
                     sourceFrame.projectionOrientation[3],
                 };
-                projectionViews[eye].pose.position = {
+                compositionViews[eye].pose.position = {
                     sourceFrame.projectionPosition[0],
                     sourceFrame.projectionPosition[1],
                     sourceFrame.projectionPosition[2],
                 };
-                projectionViews[eye].fov = {
+                compositionViews[eye].fov = {
                     sourceFrame.projectionFov[0],
                     sourceFrame.projectionFov[1],
                     sourceFrame.projectionFov[2],
                     sourceFrame.projectionFov[3],
                 };
             } else {
-                projectionViews[eye].pose = views[eye].pose;
-                projectionViews[eye].fov = views[eye].fov;
+                compositionViews[eye].pose = views[eye].pose;
+                compositionViews[eye].fov = views[eye].fov;
             }
-            projectionViews[eye].subImage.swapchain = swapchain.swapchain;
-            projectionViews[eye].subImage.imageRect.offset = {0, 0};
-            projectionViews[eye].subImage.imageRect.extent = {swapchain.width, swapchain.height};
+            compositionViews[eye].subImage.swapchain = swapchain.swapchain;
+            compositionViews[eye].subImage.imageRect.offset = {0, 0};
+            compositionViews[eye].subImage.imageRect.extent = {swapchain.width, swapchain.height};
         }
 
         projectionLayer.space = appSpace;
-        projectionLayer.viewCount = static_cast<uint32_t>(projectionViews.size());
-        projectionLayer.views = projectionViews.data();
+        projectionLayer.viewCount = viewCount;
+        projectionLayer.views = compositionViews.data();
         submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer);
 
         if (!stereoProjectionAnnounced) {
@@ -1511,15 +1604,21 @@ void main() {
         for (size_t eye = 0; eye < configViews.size(); ++eye) {
             auto& cfg = configViews[eye];
             auto& swapchain = eyeSwapchains[eye];
-            swapchain.width = static_cast<int32_t>(cfg.recommendedImageRectWidth);
-            swapchain.height = static_cast<int32_t>(cfg.recommendedImageRectHeight);
+            swapchain.width = static_cast<int32_t>(std::min(
+                cfg.maxImageRectWidth,
+                static_cast<uint32_t>(std::lround(
+                    cfg.recommendedImageRectWidth * renderScalePercent / 100.0))));
+            swapchain.height = static_cast<int32_t>(std::min(
+                cfg.maxImageRectHeight,
+                static_cast<uint32_t>(std::lround(
+                    cfg.recommendedImageRectHeight * renderScalePercent / 100.0))));
 
             XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
             createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
             createInfo.format = selectedFormat;
             createInfo.sampleCount = cfg.recommendedSwapchainSampleCount;
-            createInfo.width = cfg.recommendedImageRectWidth;
-            createInfo.height = cfg.recommendedImageRectHeight;
+            createInfo.width = swapchain.width;
+            createInfo.height = swapchain.height;
             createInfo.faceCount = 1;
             createInfo.arraySize = 1;
             createInfo.mipCount = 1;
@@ -1537,8 +1636,7 @@ void main() {
         return true;
     }
 
-    bool createOverlaySwapchains() {
-        if (configViews.empty()) return false;
+    bool createClockSwapchain() {
         uint32_t formatCount = 0;
         if (XR_FAILED(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr)) ||
             formatCount == 0) {
@@ -1561,59 +1659,50 @@ void main() {
             return false;
         }
 
-        overlaySwapchains.resize(configViews.size());
-        for (size_t eye = 0; eye < configViews.size(); ++eye) {
-            const auto& cfg = configViews[eye];
-            auto& swapchain = overlaySwapchains[eye];
-            swapchain.width = static_cast<int32_t>(cfg.recommendedImageRectWidth);
-            swapchain.height = static_cast<int32_t>(cfg.recommendedImageRectHeight);
+        XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        createInfo.format = selectedFormat;
+        createInfo.sampleCount = 1;
+        createInfo.width = clockSwapchain.width;
+        createInfo.height = clockSwapchain.height;
+        createInfo.faceCount = 1;
+        createInfo.arraySize = 1;
+        createInfo.mipCount = 1;
+        if (xrFailed(
+                xrCreateSwapchain(session, &createInfo, &clockSwapchain.swapchain),
+                "xrCreateSwapchain(clock quad)")) {
+            return false;
+        }
 
-            XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-            createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-            createInfo.format = selectedFormat;
-            createInfo.sampleCount = 1;
-            createInfo.width = cfg.recommendedImageRectWidth;
-            createInfo.height = cfg.recommendedImageRectHeight;
-            createInfo.faceCount = 1;
-            createInfo.arraySize = 1;
-            createInfo.mipCount = 1;
-            if (xrFailed(
-                    xrCreateSwapchain(session, &createInfo, &swapchain.swapchain),
-                    "xrCreateSwapchain(activity overlay)")) {
-                return false;
-            }
-
-            uint32_t imageCount = 0;
-            if (xrFailed(
-                    xrEnumerateSwapchainImages(
-                        swapchain.swapchain, 0, &imageCount, nullptr),
-                    "xrEnumerateSwapchainImages(activity overlay count)")) {
-                return false;
-            }
-            swapchain.images.assign(
-                imageCount,
-                XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
-            if (xrFailed(
-                    xrEnumerateSwapchainImages(
-                        swapchain.swapchain,
-                        imageCount,
-                        &imageCount,
-                        reinterpret_cast<XrSwapchainImageBaseHeader*>(
-                            swapchain.images.data())),
-                    "xrEnumerateSwapchainImages(activity overlay)")) {
-                return false;
-            }
+        uint32_t imageCount = 0;
+        if (xrFailed(
+                xrEnumerateSwapchainImages(
+                    clockSwapchain.swapchain, 0, &imageCount, nullptr),
+                "xrEnumerateSwapchainImages(clock count)")) {
+            return false;
+        }
+        clockSwapchain.images.assign(
+            imageCount,
+            XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+        if (xrFailed(
+                xrEnumerateSwapchainImages(
+                    clockSwapchain.swapchain,
+                    imageCount,
+                    &imageCount,
+                    reinterpret_cast<XrSwapchainImageBaseHeader*>(
+                        clockSwapchain.images.data())),
+                "xrEnumerateSwapchainImages(clock)")) {
+            return false;
         }
         return true;
     }
 
     bool createOverlayResources() {
-        if (overlaySwapchains.empty()) return false;
+        if (clockSwapchain.swapchain == XR_NULL_HANDLE) return false;
         const char* vertexSource = R"(#version 300 es
 layout(location = 0) in vec3 aPosition;
-uniform mat4 uMvp;
 void main() {
-    gl_Position = uMvp * vec4(aPosition, 1.0);
+    gl_Position = vec4(aPosition, 1.0);
 })";
         const char* fragmentSource = R"(#version 300 es
 precision mediump float;
@@ -1645,18 +1734,9 @@ void main() {
             overlayProgram = 0;
             return false;
         }
-        overlayMvpUniform = glGetUniformLocation(overlayProgram, "uMvp");
         overlayColorUniform = glGetUniformLocation(overlayProgram, "uColor");
         glGenBuffers(1, &overlayVbo);
-        glGenRenderbuffers(1, &overlayDepthBuffer);
-        glBindRenderbuffer(GL_RENDERBUFFER, overlayDepthBuffer);
-        glRenderbufferStorage(
-            GL_RENDERBUFFER,
-            GL_DEPTH_COMPONENT24,
-            overlaySwapchains[0].width,
-            overlaySwapchains[0].height);
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-        return overlayMvpUniform >= 0 && overlayColorUniform >= 0;
+        return overlayColorUniform >= 0;
     }
 
     static void appendQuad(
@@ -1673,36 +1753,8 @@ void main() {
         vertices.insert(vertices.end(), quad, quad + 18);
     }
 
-    static void appendFace(
-        std::vector<float>& vertices,
-        const XrVector3f& a,
-        const XrVector3f& b,
-        const XrVector3f& c,
-        const XrVector3f& d) {
-        const XrVector3f points[] = {a, b, c, a, c, d};
-        for (const XrVector3f& point : points) {
-            vertices.push_back(point.x);
-            vertices.push_back(point.y);
-            vertices.push_back(point.z);
-        }
-    }
-
-    static std::vector<float> cubeVertices() {
-        constexpr float h = 0.5f;
-        std::vector<float> vertices;
-        vertices.reserve(36 * 3);
-        appendFace(vertices, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h});
-        appendFace(vertices, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h});
-        appendFace(vertices, {-h, -h, -h}, {-h, -h, h}, {-h, h, h}, {-h, h, -h});
-        appendFace(vertices, {h, -h, h}, {h, -h, -h}, {h, h, -h}, {h, h, h});
-        appendFace(vertices, {-h, h, h}, {h, h, h}, {h, h, -h}, {-h, h, -h});
-        appendFace(vertices, {-h, -h, -h}, {h, -h, -h}, {h, -h, h}, {-h, -h, h});
-        return vertices;
-    }
-
     void drawOverlayGeometry(
         const std::vector<float>& vertices,
-        const Mat4& mvp,
         float red,
         float green,
         float blue,
@@ -1714,7 +1766,6 @@ void main() {
             static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
             vertices.data(),
             GL_STREAM_DRAW);
-        glUniformMatrix4fv(overlayMvpUniform, 1, GL_FALSE, mvp.m);
         glUniform4f(overlayColorUniform, red, green, blue, alpha);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
@@ -1732,9 +1783,9 @@ void main() {
             0x3f, 0x06, 0x5b, 0x4f, 0x66,
             0x6d, 0x7d, 0x07, 0x7f, 0x6f,
         };
-        constexpr float w = 0.034f;
-        constexpr float h = 0.064f;
-        constexpr float t = 0.006f;
+        constexpr float w = 0.32f;
+        constexpr float h = 0.90f;
+        constexpr float t = 0.055f;
         const float middle = y + h * 0.5f;
         const uint8_t mask = masks[digit < 0 || digit > 9 ? 0 : digit];
         if (mask & 0x01) appendQuad(vertices, x + t, y + h - t, x + w - t, y + h, z);
@@ -1746,35 +1797,59 @@ void main() {
         if (mask & 0x40) appendQuad(vertices, x + t, middle - t * 0.5f, x + w - t, middle + t * 0.5f, z);
     }
 
-    void drawClock(const Mat4& viewProjection, const XrPosef& headPose) {
-        if (!handInputs[0].active || !handInputs[0].gripValid) return;
+    bool updateClockTexture() {
+        const std::time_t now = std::time(nullptr);
+        const int64_t minute = static_cast<int64_t>(now / 60);
+        if (renderedClockMinute == minute) return true;
 
-        XrPosef clockPose{};
-        clockPose.orientation = headPose.orientation;
-        clockPose.position = handInputs[0].grip.position;
-        clockPose.position.y += 0.22f;
-        const Mat4 clockMvp = multiply(viewProjection, poseMatrix(clockPose));
+        uint32_t imageIndex = 0;
+        XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (xrFailed(
+                xrAcquireSwapchainImage(clockSwapchain.swapchain, &acquireInfo, &imageIndex),
+                "xrAcquireSwapchainImage(clock)")) {
+            return false;
+        }
+        XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        waitInfo.timeout = XR_INFINITE_DURATION;
+        if (xrFailed(
+                xrWaitSwapchainImage(clockSwapchain.swapchain, &waitInfo),
+                "xrWaitSwapchainImage(clock)")) {
+            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(clockSwapchain.swapchain, &releaseInfo);
+            return false;
+        }
 
-        constexpr float digitW = 0.034f;
-        constexpr float digitH = 0.064f;
-        constexpr float gap = 0.007f;
-        constexpr float colonW = 0.012f;
-        constexpr float totalW = digitW * 4.0f + gap * 4.0f + colonW;
-        const float startX = -totalW * 0.5f;
-        const float startY = -digitH * 0.5f;
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            clockSwapchain.images[imageIndex].image,
+            0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            LOGW("Clock quad framebuffer incomplete");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(clockSwapchain.swapchain, &releaseInfo);
+            return false;
+        }
+
+        glViewport(0, 0, clockSwapchain.width, clockSwapchain.height);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(overlayProgram);
 
         std::vector<float> panel;
-        appendQuad(
-            panel,
-            startX - 0.012f,
-            startY - 0.010f,
-            startX + totalW + 0.012f,
-            startY + digitH + 0.010f,
-            -0.003f);
-        glDisable(GL_CULL_FACE);
-        drawOverlayGeometry(panel, clockMvp, 0.01f, 0.025f, 0.035f, 0.78f);
+        panel.reserve(18);
+        appendQuad(panel, -0.90f, -0.56f, 0.90f, 0.56f, 0.0f);
+        drawOverlayGeometry(panel, 0.01f, 0.025f, 0.035f, 0.78f);
 
-        std::time_t now = std::time(nullptr);
         std::tm local{};
         localtime_r(&now, &local);
         const int digits[4] = {
@@ -1783,143 +1858,63 @@ void main() {
             local.tm_min / 10,
             local.tm_min % 10,
         };
+        constexpr float digitW = 0.32f;
+        constexpr float digitH = 0.90f;
+        constexpr float gap = 0.055f;
+        constexpr float colonW = 0.10f;
+        constexpr float totalW = digitW * 4.0f + gap * 4.0f + colonW;
+        const float startX = -totalW * 0.5f;
+        const float startY = -digitH * 0.5f;
         std::vector<float> text;
+        text.reserve(4 * 7 * 18 + 36);
         float x = startX;
         appendDigit(text, digits[0], x, startY, 0.0f);
         x += digitW + gap;
         appendDigit(text, digits[1], x, startY, 0.0f);
         x += digitW + gap;
-        appendQuad(text, x + 0.003f, startY + 0.018f, x + 0.009f, startY + 0.024f, 0.0f);
-        appendQuad(text, x + 0.003f, startY + 0.040f, x + 0.009f, startY + 0.046f, 0.0f);
+        appendQuad(text, x + 0.025f, startY + 0.25f, x + 0.075f, startY + 0.32f, 0.0f);
+        appendQuad(text, x + 0.025f, startY + 0.58f, x + 0.075f, startY + 0.65f, 0.0f);
         x += colonW + gap;
         appendDigit(text, digits[2], x, startY, 0.0f);
         x += digitW + gap;
         appendDigit(text, digits[3], x, startY, 0.0f);
-        drawOverlayGeometry(text, clockMvp, 0.72f, 0.94f, 1.0f, 0.98f);
-    }
+        drawOverlayGeometry(text, 0.72f, 0.94f, 1.0f, 0.98f);
 
-    bool drawActivityOverlayEye(uint32_t eye, GLuint texture) {
-        auto& swapchain = overlaySwapchains[eye];
-        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(
-            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-        glFramebufferRenderbuffer(
-            GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, overlayDepthBuffer);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            LOGW("Activity overlay framebuffer incomplete for eye %u", eye);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            return false;
-        }
-
-        glViewport(0, 0, swapchain.width, swapchain.height);
-        glDisable(GL_SCISSOR_TEST);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        glClearDepthf(1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_TRUE);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        glUseProgram(overlayProgram);
-
-        const Mat4 viewProjection = multiply(
-            projectionMatrix(views[eye].fov),
-            inversePoseMatrix(views[eye].pose));
-        const std::vector<float> cube = cubeVertices();
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_BACK);
-        for (int hand = 0; hand < 2; ++hand) {
-            if (!handInputs[hand].active || !handInputs[hand].gripValid) continue;
-            const Mat4 model = multiply(
-                poseMatrix(handInputs[hand].grip),
-                scaleMatrix(kHandCubeSizeMeters, kHandCubeSizeMeters, kHandCubeSizeMeters));
-            const Mat4 mvp = multiply(viewProjection, model);
-            if (hand == 0) {
-                drawOverlayGeometry(cube, mvp, 0.08f, 0.72f, 1.0f, 0.86f);
-            } else {
-                drawOverlayGeometry(cube, mvp, 1.0f, 0.36f, 0.08f, 0.86f);
-            }
-        }
-        drawClock(viewProjection, views[0].pose);
-
-        glDisable(GL_CULL_FACE);
         glDisable(GL_BLEND);
-        glDisable(GL_DEPTH_TEST);
         glUseProgram(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glFlush();
+
+        XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(clockSwapchain.swapchain, &releaseInfo);
+        renderedClockMinute = minute;
         return true;
     }
 
     bool renderActivityOverlay(
-        const XrFrameState& frameState,
-        std::vector<XrCompositionLayerProjectionView>& overlayViews,
-        XrCompositionLayerProjection& overlayLayer) {
-        if (!overlayReady || overlaySwapchains.empty()) return false;
-        const bool anyHand =
-            (handInputs[0].active && handInputs[0].gripValid) ||
-            (handInputs[1].active && handInputs[1].gripValid);
-        if (!anyHand) return false;
-
-        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.viewConfigurationType = kViewType;
-        locateInfo.displayTime = frameState.predictedDisplayTime;
-        locateInfo.space = appSpace;
-        XrViewState viewState{XR_TYPE_VIEW_STATE};
-        uint32_t viewCount = static_cast<uint32_t>(views.size());
-        const XrResult locateResult = xrLocateViews(
-            session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
-        if (XR_FAILED(locateResult) ||
-            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+        bool viewsValid,
+        uint32_t viewCount,
+        XrCompositionLayerQuad& clockLayer) {
+        if (!overlayReady || !clockEnabled || clockSwapchain.swapchain == XR_NULL_HANDLE ||
+            !viewsValid || viewCount == 0 ||
+            !handInputs[0].active || !handInputs[0].gripValid ||
+            !updateClockTexture()) {
             return false;
         }
-        viewCount = std::min(
-            viewCount, static_cast<uint32_t>(overlaySwapchains.size()));
-        overlayViews.assign(
-            viewCount,
-            XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
-        for (uint32_t eye = 0; eye < viewCount; ++eye) {
-            auto& swapchain = overlaySwapchains[eye];
-            uint32_t imageIndex = 0;
-            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            if (xrFailed(
-                    xrAcquireSwapchainImage(
-                        swapchain.swapchain, &acquireInfo, &imageIndex),
-                    "xrAcquireSwapchainImage(activity overlay)")) {
-                return false;
-            }
-            XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            waitInfo.timeout = XR_INFINITE_DURATION;
-            if (xrFailed(
-                    xrWaitSwapchainImage(swapchain.swapchain, &waitInfo),
-                    "xrWaitSwapchainImage(activity overlay)")) {
-                XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
-                return false;
-            }
-            const bool rendered = drawActivityOverlayEye(
-                eye, swapchain.images[imageIndex].image);
-            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
-            if (!rendered) return false;
-
-            overlayViews[eye].pose = views[eye].pose;
-            overlayViews[eye].fov = views[eye].fov;
-            overlayViews[eye].subImage.swapchain = swapchain.swapchain;
-            overlayViews[eye].subImage.imageRect.offset = {0, 0};
-            overlayViews[eye].subImage.imageRect.extent = {
-                swapchain.width, swapchain.height};
-        }
-
-        overlayLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-        overlayLayer.space = appSpace;
-        overlayLayer.viewCount = static_cast<uint32_t>(overlayViews.size());
-        overlayLayer.views = overlayViews.data();
-        return !overlayViews.empty();
+        clockLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        clockLayer.space = appSpace;
+        clockLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        clockLayer.subImage.swapchain = clockSwapchain.swapchain;
+        clockLayer.subImage.imageRect.offset = {0, 0};
+        clockLayer.subImage.imageRect.extent = {
+            clockSwapchain.width, clockSwapchain.height};
+        clockLayer.pose.orientation = views[0].pose.orientation;
+        clockLayer.pose.position = handInputs[0].grip.position;
+        clockLayer.pose.position.y += 0.22f;
+        clockLayer.size = {0.22f, 0.09f};
+        return true;
     }
 
     void notifySurfaceDestroyed(JNIEnv* env) {
@@ -1986,6 +1981,23 @@ void main() {
         }
     }
 
+    uint32_t locateFrameViews(XrTime displayTime, bool& orientationValid) {
+        orientationValid = false;
+        if (appSpace == XR_NULL_HANDLE || views.empty()) return 0;
+        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+        locateInfo.viewConfigurationType = kViewType;
+        locateInfo.displayTime = displayTime;
+        locateInfo.space = appSpace;
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        uint32_t viewCount = static_cast<uint32_t>(views.size());
+        const XrResult result = xrLocateViews(
+            session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
+        if (XR_FAILED(result)) return 0;
+        orientationValid =
+            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+        return viewCount;
+    }
+
     void renderFrame(JNIEnv* env) {
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
@@ -1994,19 +2006,25 @@ void main() {
         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
         if (xrFailed(xrBeginFrame(session, &beginInfo), "xrBeginFrame")) return;
 
+        bool viewsValid = false;
+        const uint32_t viewCount = locateFrameViews(
+            frameState.predictedDisplayTime, viewsValid);
+
         XrCompositionLayerQuad quadLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        std::vector<XrCompositionLayerProjectionView> projectionViews;
+        XrCompositionLayerQuad clockLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* submittedLayer = nullptr;
-        std::vector<XrCompositionLayerProjectionView> overlayViews;
-        XrCompositionLayerProjection overlayLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        std::vector<const XrCompositionLayerBaseHeader*> submittedLayers;
+        std::array<const XrCompositionLayerBaseHeader*, 2> submittedLayers{};
+        uint32_t submittedLayerCount = 0;
 
-        publishFrameState(frameState);
         syncInput(frameState.predictedDisplayTime);
+        // Publish timing only after controller state is current. WAIT_FRAME on the
+        // Windows side wakes on this callback, so this ordering avoids returning the
+        // previous headset frame's input to the game.
+        publishFrameState(frameState, viewCount);
 
-        const bool stereoRendered = frameState.shouldRender &&
-            renderStereoProjection(frameState, projectionViews, projectionLayer, submittedLayer);
+        const bool stereoRendered = frameState.shouldRender && viewsValid &&
+            renderStereoProjection(viewCount, projectionLayer, submittedLayer);
         if (stereoRendered) {
             // True per-eye stereo from the game's AHardwareBuffers; submittedLayer is set.
             if (stereoProjectionAnnounced) {
@@ -2015,7 +2033,8 @@ void main() {
                     stereoMilestonePublished = true;
                 }
             }
-        } else if (frameState.shouldRender && screenSwapchain.swapchain != XR_NULL_HANDLE) {
+        } else if (frameState.shouldRender && theaterScreenEnabled &&
+                   screenSwapchain.swapchain != XR_NULL_HANDLE) {
             renderScreenTexture();
             quadLayer.space = appSpace;
             quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -2029,66 +2048,55 @@ void main() {
             quadLayer.size.width = 2.6f;
             quadLayer.size.height = 2.6f * 9.0f / 16.0f;
             submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
-        } else if (frameState.shouldRender && !eyeSwapchains.empty()) {
-            XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-            locateInfo.viewConfigurationType = kViewType;
-            locateInfo.displayTime = frameState.predictedDisplayTime;
-            locateInfo.space = appSpace;
-
-            XrViewState viewState{XR_TYPE_VIEW_STATE};
-            uint32_t viewCount = static_cast<uint32_t>(views.size());
-            XrResult locateResult = xrLocateViews(session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
-            if (XR_SUCCEEDED(locateResult) && (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0) {
-                projectionViews.assign(viewCount, XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-                for (uint32_t eye = 0; eye < viewCount; ++eye) {
+        } else if (frameState.shouldRender && theaterScreenEnabled && viewsValid &&
+                   !eyeSwapchains.empty()) {
+            const uint32_t fallbackViewCount = std::min(
+                viewCount, static_cast<uint32_t>(eyeSwapchains.size()));
+            if (fallbackViewCount > 0) {
+                for (uint32_t eye = 0; eye < fallbackViewCount; ++eye) {
+                    compositionViews[eye] = {
+                        XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                     renderEye(eye);
-                    projectionViews[eye].pose = views[eye].pose;
-                    projectionViews[eye].fov = views[eye].fov;
-                    projectionViews[eye].subImage.swapchain = eyeSwapchains[eye].swapchain;
-                    projectionViews[eye].subImage.imageRect.offset = {0, 0};
-                    projectionViews[eye].subImage.imageRect.extent = {eyeSwapchains[eye].width, eyeSwapchains[eye].height};
+                    compositionViews[eye].pose = views[eye].pose;
+                    compositionViews[eye].fov = views[eye].fov;
+                    compositionViews[eye].subImage.swapchain = eyeSwapchains[eye].swapchain;
+                    compositionViews[eye].subImage.imageRect.offset = {0, 0};
+                    compositionViews[eye].subImage.imageRect.extent = {
+                        eyeSwapchains[eye].width, eyeSwapchains[eye].height};
                 }
 
                 projectionLayer.space = appSpace;
-                projectionLayer.viewCount = static_cast<uint32_t>(projectionViews.size());
-                projectionLayer.views = projectionViews.data();
+                projectionLayer.viewCount = fallbackViewCount;
+                projectionLayer.views = compositionViews.data();
                 submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer);
             }
         }
 
-        if (submittedLayer != nullptr) submittedLayers.push_back(submittedLayer);
+        if (submittedLayer != nullptr) submittedLayers[submittedLayerCount++] = submittedLayer;
         if (frameState.shouldRender &&
-            renderActivityOverlay(frameState, overlayViews, overlayLayer)) {
-            submittedLayers.push_back(
-                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&overlayLayer));
+            renderActivityOverlay(viewsValid, viewCount, clockLayer)) {
+            submittedLayers[submittedLayerCount++] =
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&clockLayer);
         }
 
         XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
         endInfo.environmentBlendMode = blendMode;
-        endInfo.layerCount = static_cast<uint32_t>(submittedLayers.size());
-        endInfo.layers = submittedLayers.empty() ? nullptr : submittedLayers.data();
+        endInfo.layerCount = submittedLayerCount;
+        endInfo.layers = submittedLayerCount == 0 ? nullptr : submittedLayers.data();
         xrEndFrame(session, &endInfo);
     }
 
     // Publish predicted timing + full per-eye poses/FOV to the activity, which forwards
     // them to XrBridgeServer so the Windows game's xrWaitFrame/xrLocateViews are backed
     // by real Quest tracking data.
-    void publishFrameState(const XrFrameState& frameState) {
+    void publishFrameState(const XrFrameState& frameState, uint32_t viewCount) {
         if (activityFrameStateMethod == nullptr || trackingArrayRef == nullptr ||
             appSpace == XR_NULL_HANDLE || views.empty()) {
             return;
         }
 
-        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-        locateInfo.viewConfigurationType = kViewType;
-        locateInfo.displayTime = frameState.predictedDisplayTime;
-        locateInfo.space = appSpace;
-
-        XrViewState viewState{XR_TYPE_VIEW_STATE};
-        uint32_t viewCount = static_cast<uint32_t>(views.size());
-        XrResult locateResult = xrLocateViews(session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
-        if (XR_FAILED(locateResult) || viewCount == 0) return;
+        if (viewCount == 0) return;
 
         JNIEnv* env = nullptr;
         if (javaVm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || env == nullptr) {
@@ -2161,22 +2169,12 @@ void main() {
         glViewport(0, 0, screenSwapchain.width, screenSwapchain.height);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
         glUseProgram(blitProgram);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
-        glUniform1i(glGetUniformLocation(blitProgram, "uTexture"), 0);
-        glBindBuffer(GL_ARRAY_BUFFER, blitVbo);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(0));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
+        glBindVertexArray(blitVao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
         glUseProgram(0);
 
@@ -2264,13 +2262,11 @@ void main() {
                 swapchain.swapchain = XR_NULL_HANDLE;
             }
         }
-        for (auto& swapchain : overlaySwapchains) {
-            if (swapchain.swapchain != XR_NULL_HANDLE) {
-                xrDestroySwapchain(swapchain.swapchain);
-                swapchain.swapchain = XR_NULL_HANDLE;
-            }
+        if (clockSwapchain.swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(clockSwapchain.swapchain);
+            clockSwapchain.swapchain = XR_NULL_HANDLE;
         }
-        overlaySwapchains.clear();
+        clockSwapchain.images.clear();
         overlayReady = false;
         for (int hand = 0; hand < 2; ++hand) {
             if (gripSpaces[hand] != XR_NULL_HANDLE) {
@@ -2317,6 +2313,10 @@ void main() {
             glDeleteBuffers(1, &blitVbo);
             blitVbo = 0;
         }
+        if (blitVao != 0) {
+            glDeleteVertexArrays(1, &blitVao);
+            blitVao = 0;
+        }
         if (blitProgram != 0) {
             glDeleteProgram(blitProgram);
             blitProgram = 0;
@@ -2337,19 +2337,27 @@ void main() {
                     glDeleteTextures(1, &eyeTextures[eye][image]);
                     eyeTextures[eye][image] = 0;
                 }
+                if (eyeCpuMappings[eye][image] != nullptr) {
+                    ::munmap(
+                        eyeCpuMappings[eye][image],
+                        eyeCpuMappingLengths[eye][image]);
+                    eyeCpuMappings[eye][image] = nullptr;
+                    eyeCpuMappingLengths[eye][image] = 0;
+                    eyeCpuMappingRegistrations[eye][image] = 0;
+                }
             }
         }
         if (blit2DVbo != 0) {
             glDeleteBuffers(1, &blit2DVbo);
             blit2DVbo = 0;
         }
+        if (blit2DVao != 0) {
+            glDeleteVertexArrays(1, &blit2DVao);
+            blit2DVao = 0;
+        }
         if (blit2DProgram != 0) {
             glDeleteProgram(blit2DProgram);
             blit2DProgram = 0;
-        }
-        if (overlayDepthBuffer != 0) {
-            glDeleteRenderbuffers(1, &overlayDepthBuffer);
-            overlayDepthBuffer = 0;
         }
         if (overlayVbo != 0) {
             glDeleteBuffers(1, &overlayVbo);
@@ -2373,14 +2381,24 @@ void main() {
 } // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_app_gamenative_xr_QuestVrActivity_nativeStart(JNIEnv* env, jobject activity) {
+Java_app_gamenative_xr_QuestVrActivity_nativeStart(
+    JNIEnv* env,
+    jobject activity,
+    jint renderScalePercent,
+    jboolean theaterScreenEnabled,
+    jboolean clockEnabled) {
     JavaVM* vm = nullptr;
     if (env->GetJavaVM(&vm) != JNI_OK || vm == nullptr) {
         LOGE("GetJavaVM failed");
         return 0;
     }
     jobject activityRef = env->NewGlobalRef(activity);
-    auto* app = new QuestXrApp(vm, activityRef);
+    auto* app = new QuestXrApp(
+        vm,
+        activityRef,
+        static_cast<int>(renderScalePercent),
+        theaterScreenEnabled == JNI_TRUE,
+        clockEnabled == JNI_TRUE);
     app->start();
     return reinterpret_cast<jlong>(app);
 }

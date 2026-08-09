@@ -5,6 +5,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <errno.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
@@ -19,22 +20,43 @@
 namespace gamenative::xr {
 namespace {
 
-// Read one '\n'-terminated line, byte-by-byte. We must not buffer past the newline:
+// Read one '\n'-terminated line without consuming past the newline:
 // after a BUFFER line the very next bytes on the socket are the ancillary AHardwareBuffer
 // message, which AHardwareBuffer_recvHandleFromUnixSocket reads directly from the fd.
 // Returns false on EOF/error. Line excludes the trailing newline.
 bool readLine(int fd, std::string& out) {
     out.clear();
-    char ch = 0;
+    char buffer[512];
     while (true) {
-        ssize_t got = recv(fd, &ch, 1, 0);
+        // Peek first so we never consume the one-byte payload carrying an SCM_RIGHTS
+        // handle after a BUFFER/DMABUF command. Once the newline boundary is known, read
+        // the whole text chunk at once instead of issuing one recv syscall per character.
+        ssize_t got = recv(fd, buffer, sizeof(buffer), MSG_PEEK);
         if (got == 0) return false;            // peer closed
         if (got < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        if (ch == '\n') return true;
-        if (out.size() < 512) out.push_back(ch);
+        const void* newlinePtr = std::memchr(buffer, '\n', static_cast<size_t>(got));
+        const size_t consume = newlinePtr != nullptr
+            ? static_cast<const char*>(newlinePtr) - buffer + 1
+            : static_cast<size_t>(got);
+        size_t consumed = 0;
+        while (consumed < consume) {
+            const ssize_t read = recv(fd, buffer + consumed, consume - consumed, 0);
+            if (read == 0) return false;
+            if (read < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            consumed += static_cast<size_t>(read);
+        }
+        const size_t textBytes = newlinePtr != nullptr ? consume - 1 : consume;
+        if (out.size() < 512) {
+            const size_t available = 512 - out.size();
+            out.append(buffer, std::min(textBytes, available));
+        }
+        if (newlinePtr != nullptr) return true;
     }
 }
 
