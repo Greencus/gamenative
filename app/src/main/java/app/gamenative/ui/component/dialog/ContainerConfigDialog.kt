@@ -133,6 +133,19 @@ import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
 
+private enum class ContainerConfigTab {
+    GENERAL,
+    GRAPHICS,
+    VR,
+    EMULATION,
+    CONTROLLER,
+    WINE,
+    WIN_COMPONENTS,
+    ENVIRONMENT,
+    DRIVES,
+    ADVANCED,
+}
+
 /**
  * Gets the component title for Win Components settings group.
  */
@@ -281,6 +294,7 @@ fun ContainerConfigDialog(
     initialConfig: ContainerData = ContainerData(),
     onDismissRequest: () -> Unit,
     onSave: (ContainerData) -> Unit,
+    onVrConfigChanged: (ContainerData) -> Unit = {},
 ) {
     if (visible) {
         val context = LocalContext.current
@@ -1244,7 +1258,12 @@ fun ContainerConfigDialog(
                             },
                             actions = {
                                 IconButton(
-                                    onClick = { onSave(config) },
+                                    onClick = {
+                                        // Commit the dedicated XR preference store before the
+                                        // general container writer can close the editor or launch.
+                                        onVrConfigChanged(config)
+                                        onSave(config)
+                                    },
                                     content = { Icon(Icons.Default.Save, null) },
                                 )
                             },
@@ -1252,28 +1271,25 @@ fun ContainerConfigDialog(
                     },
                 ) { paddingValues ->
                     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
-                    val tabs = listOf(
-                        stringResource(R.string.container_config_tab_general),
-                        stringResource(R.string.container_config_tab_graphics),
-                        stringResource(R.string.container_config_tab_emulation),
-                        stringResource(R.string.container_config_tab_controller),
-                        stringResource(R.string.container_config_tab_wine),
-                        stringResource(R.string.container_config_tab_win_components),
-                        stringResource(R.string.container_config_tab_environment),
-                        stringResource(R.string.container_config_tab_drives),
-                        stringResource(R.string.container_config_tab_advanced)
-                    )
-
+                    val tabs = buildList {
+                        add(ContainerConfigTab.GENERAL to stringResource(R.string.container_config_tab_general))
+                        add(ContainerConfigTab.GRAPHICS to stringResource(R.string.container_config_tab_graphics))
+                        if (BuildConfig.XR_BUILD && !default) {
+                            add(ContainerConfigTab.VR to stringResource(R.string.container_config_tab_vr))
+                        }
+                        add(ContainerConfigTab.EMULATION to stringResource(R.string.container_config_tab_emulation))
+                        add(ContainerConfigTab.CONTROLLER to stringResource(R.string.container_config_tab_controller))
+                        add(ContainerConfigTab.WINE to stringResource(R.string.container_config_tab_wine))
+                        add(ContainerConfigTab.WIN_COMPONENTS to stringResource(R.string.container_config_tab_win_components))
+                        add(ContainerConfigTab.ENVIRONMENT to stringResource(R.string.container_config_tab_environment))
+                        add(ContainerConfigTab.DRIVES to stringResource(R.string.container_config_tab_drives))
+                        add(ContainerConfigTab.ADVANCED to stringResource(R.string.container_config_tab_advanced))
+                    }
                     // Let controller shoulder buttons cycle through the tabs: R1/R2
                     // forward, L1/L2 back (both wrap). The handler lives on the content
-                    // container (not a focusable wrapper, which would break up/down
-                    // traversal), so it fires whenever focus is anywhere in the tabs or
-                    // content below.
+                    // container so it fires whenever focus is in the tabs or content.
                     val firstTabFocusRequester = remember { FocusRequester() }
-                    // Seed focus onto the first tab when the dialog opens so the gamepad
-                    // can navigate immediately instead of needing a button press first.
                     LaunchedEffect(Unit) { runCatching { firstTabFocusRequester.requestFocus() } }
-
                     Column(
                         modifier = Modifier
                             .onPreviewKeyEvent { event ->
@@ -1299,7 +1315,7 @@ fun ContainerConfigDialog(
                             .fillMaxSize(),
                     ) {
                         ScrollableTabRow(selectedTabIndex = selectedTab, edgePadding = 0.dp) {
-                            tabs.forEachIndexed { index, label ->
+                            tabs.forEachIndexed { index, (_, label) ->
                                 Tab(
                                     selected = selectedTab == index,
                                     onClick = { selectedTab = index },
@@ -1317,15 +1333,19 @@ fun ContainerConfigDialog(
                                 .verticalScroll(scrollState)
                                 .weight(1f),
                         ) {
-                            if (selectedTab == 0) GeneralTabContent(state, nonzeroResolutionError, aspectResolutionError)
-                            if (selectedTab == 1) GraphicsTabContent(state, default)
-                            if (selectedTab == 2) EmulationTabContent(state)
-                            if (selectedTab == 3) ControllerTabContent(state, default)
-                            if (selectedTab == 4) WineTabContent(state)
-                            if (selectedTab == 5) WinComponentsTabContent(state)
-                            if (selectedTab == 6) EnvironmentTabContent(state)
-                            if (selectedTab == 7) DrivesTabContent(state)
-                            if (selectedTab == 8) AdvancedTabContent(state)
+                            when (tabs.getOrNull(selectedTab)?.first) {
+                                ContainerConfigTab.GENERAL -> GeneralTabContent(state, nonzeroResolutionError, aspectResolutionError)
+                                ContainerConfigTab.GRAPHICS -> GraphicsTabContent(state, default)
+                                ContainerConfigTab.VR -> VrTabContent(state, onVrConfigChanged)
+                                ContainerConfigTab.EMULATION -> EmulationTabContent(state)
+                                ContainerConfigTab.CONTROLLER -> ControllerTabContent(state, default)
+                                ContainerConfigTab.WINE -> WineTabContent(state)
+                                ContainerConfigTab.WIN_COMPONENTS -> WinComponentsTabContent(state)
+                                ContainerConfigTab.ENVIRONMENT -> EnvironmentTabContent(state)
+                                ContainerConfigTab.DRIVES -> DrivesTabContent(state)
+                                ContainerConfigTab.ADVANCED -> AdvancedTabContent(state)
+                                null -> Unit
+                            }
                         }
                     }
                 }

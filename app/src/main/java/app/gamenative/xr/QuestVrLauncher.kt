@@ -8,6 +8,7 @@ import android.hardware.display.DisplayManager
 import android.view.Display
 import app.gamenative.PluviaApp
 import app.gamenative.data.LaunchInfo
+import app.gamenative.utils.ContainerUtils
 
 object QuestVrLauncher {
     const val EXTRA_APP_ID = "app.gamenative.xr.APP_ID"
@@ -20,6 +21,10 @@ object QuestVrLauncher {
     const val EXTRA_LAUNCH_DESCRIPTION = "app.gamenative.xr.LAUNCH_DESCRIPTION"
     const val EXTRA_LAUNCH_TYPE = "app.gamenative.xr.LAUNCH_TYPE"
     const val EXTRA_LAUNCH_ARGUMENTS = "app.gamenative.xr.LAUNCH_ARGUMENTS"
+    const val EXTRA_RENDER_SCALE = "app.gamenative.xr.RENDER_SCALE"
+    const val EXTRA_OPENCOMPOSITE = "app.gamenative.xr.OPENCOMPOSITE"
+    const val EXTRA_THEATER_SCREEN = "app.gamenative.xr.THEATER_SCREEN"
+    const val EXTRA_CLOCK = "app.gamenative.xr.CLOCK"
 
     fun launch(
         activity: Activity,
@@ -39,6 +44,11 @@ object QuestVrLauncher {
             arguments = launchInfo?.arguments.orEmpty(),
         )
 
+        val xrSettings = runCatching {
+            val container = ContainerUtils.getContainer(activity, appId)
+            XrContainerSettings.read(activity, appId, container)
+        }.getOrDefault(XrContainerSettings.Values())
+
         val intent = Intent(activity, QuestVrActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -47,6 +57,12 @@ object QuestVrLauncher {
             putExtra(EXTRA_TEST_GRAPHICS, testGraphics)
             putExtra(EXTRA_IS_OFFLINE, isOffline)
             putExtra(EXTRA_RESOLVED_EXECUTABLE, resolvedExecutable)
+            // Carry the exact durable snapshot into the XR activity. This avoids a second,
+            // potentially racing container read during the activity hand-off.
+            putExtra(EXTRA_RENDER_SCALE, xrSettings.renderScale)
+            putExtra(EXTRA_OPENCOMPOSITE, xrSettings.openCompositeEnabled)
+            putExtra(EXTRA_THEATER_SCREEN, xrSettings.theaterScreenEnabled)
+            putExtra(EXTRA_CLOCK, xrSettings.clockEnabled)
             launchInfo?.let {
                 putExtra(EXTRA_LAUNCH_EXECUTABLE, it.executable)
                 putExtra(EXTRA_LAUNCH_WORKING_DIR, it.workingDir)

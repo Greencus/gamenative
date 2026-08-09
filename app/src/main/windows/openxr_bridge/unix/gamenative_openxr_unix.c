@@ -539,7 +539,12 @@ static int create_image(struct gn_swapchain *swapchain, struct gn_image *out,
 
     VkMemoryRequirements requirements;
     p_vkGetImageMemoryRequirements(device, out->image, &requirements);
-    int memory_type = find_memory_type(requirements.memoryTypeBits, 0);
+    /* The Quest EGL driver cannot import Turnip's standard RGB dma-buf
+     * FourCCs.  Prefer CPU-visible unified memory so the Android consumer can
+     * fall back to mmap + texture upload without changing the D3D11 image. */
+    int memory_type = find_memory_type(
+        requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (memory_type < 0) {
         log_line("No compatible memory type for dma-buf image");
         goto fail;

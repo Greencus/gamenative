@@ -108,6 +108,14 @@ data class ContainerData(
     val lsfgEnabled: Boolean = false,
     /** Whether bionic-fg AI frame generation is enabled for this container */
     val bionicFgEnabled: Boolean = false,
+    /** OpenXR render size as a percentage of the headset-recommended per-eye size. */
+    val xrRenderScale: Int = 100,
+    /** Use OpenComposite for games that expose OpenVR rather than OpenXR. */
+    val xrOpenCompositeEnabled: Boolean = true,
+    /** Show the container desktop as a floating screen until stereo frames arrive. */
+    val xrTheaterScreenEnabled: Boolean = true,
+    /** Draw a clock above the left controller in the native XR overlay. */
+    val xrClockEnabled: Boolean = true,
 ) {
     companion object {
         val Saver = mapSaver(
@@ -180,6 +188,10 @@ data class ContainerData(
                     "sharpnessDenoise" to state.sharpnessDenoise,
                     "lsfgEnabled" to state.lsfgEnabled,
                     "bionicFgEnabled" to state.bionicFgEnabled,
+                    "xrRenderScale" to state.xrRenderScale,
+                    "xrOpenCompositeEnabled" to state.xrOpenCompositeEnabled,
+                    "xrTheaterScreenEnabled" to state.xrTheaterScreenEnabled,
+                    "xrClockEnabled" to state.xrClockEnabled,
                 )
             },
             restore = { savedMap ->
@@ -251,6 +263,10 @@ data class ContainerData(
                     sharpnessDenoise = (savedMap["sharpnessDenoise"] as? Int) ?: 100,
                     lsfgEnabled = (savedMap["lsfgEnabled"] as? Boolean) ?: false,
                     bionicFgEnabled = (savedMap["bionicFgEnabled"] as? Boolean) ?: false,
+                    xrRenderScale = (savedMap["xrRenderScale"] as? Int) ?: 100,
+                    xrOpenCompositeEnabled = (savedMap["xrOpenCompositeEnabled"] as? Boolean) ?: true,
+                    xrTheaterScreenEnabled = (savedMap["xrTheaterScreenEnabled"] as? Boolean) ?: true,
+                    xrClockEnabled = (savedMap["xrClockEnabled"] as? Boolean) ?: true,
                 )
             },
         )

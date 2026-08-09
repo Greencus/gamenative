@@ -1301,6 +1301,7 @@
     <string name="container_config_unsaved_changes_message">Are you sure you\'d like to discard your changes?</string>
     <string name="container_config_tab_general">General</string>
     <string name="container_config_tab_graphics">Graphics</string>
+    <string name="container_config_tab_vr">VR</string>
     <string name="container_config_tab_emulation">Emulation</string>
     <string name="container_config_tab_controller">Controller</string>
     <string name="container_config_tab_wine">Wine</string>
@@ -1308,6 +1309,14 @@
     <string name="container_config_tab_environment">Environment</string>
     <string name="container_config_tab_drives">Drives</string>
     <string name="container_config_tab_advanced">Advanced</string>
+    <string name="vr_render_resolution">Per-eye render resolution</string>
+    <string name="vr_render_resolution_description">Scale the headset-recommended size. Lower values improve performance; higher values improve clarity.</string>
+    <string name="vr_opencomposite">OpenComposite compatibility</string>
+    <string name="vr_opencomposite_description">Translate OpenVR games to the GameNative OpenXR runtime.</string>
+    <string name="vr_theater_screen">Desktop theater screen</string>
+    <string name="vr_theater_screen_description">Show the container desktop on a floating screen while no stereo game image is available.</string>
+    <string name="vr_left_hand_clock">Left-hand clock</string>
+    <string name="vr_left_hand_clock_description">Show the current time above the left controller.</string>
     <string name="container_config_vkd3d_version">VKD3D Version</string>
     <string name="container_config_executable_path">Executable Path</string>
     <string name="container_config_executable_path_placeholder">e.g., path\\to\\exe</string>

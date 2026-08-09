@@ -448,7 +448,7 @@ class CustomGameAppScreen : BaseAppScreen() {
 
     override fun loadContainerData(context: Context, libraryItem: LibraryItem): ContainerData {
         val container = ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
-        return ContainerUtils.toContainerData(container)
+        return ContainerUtils.toContainerData(context, container)
     }
 
     override fun saveContainerConfig(context: Context, libraryItem: LibraryItem, config: ContainerData) {

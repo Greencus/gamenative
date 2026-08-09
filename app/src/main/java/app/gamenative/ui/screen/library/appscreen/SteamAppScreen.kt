@@ -920,7 +920,7 @@ class SteamAppScreen : BaseAppScreen() {
 
     override fun loadContainerData(context: Context, libraryItem: LibraryItem): ContainerData {
         val container = ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
-        return ContainerUtils.toContainerData(container)
+        return ContainerUtils.toContainerData(context, container)
     }
 
     override fun saveContainerConfig(context: Context, libraryItem: LibraryItem, config: ContainerData) {
@@ -1189,7 +1189,7 @@ class SteamAppScreen : BaseAppScreen() {
                 mutableStateOf(XrLaunchPreferences.shouldPromptEveryLaunch(container))
             }
             var openCompositeEnabled by remember(gameId) {
-                mutableStateOf(XrRuntimeManager.isOpenCompositeEnabled(container))
+                mutableStateOf(XrRuntimeManager.isOpenCompositeEnabled(context, container))
             }
             val launchAfterSave = shouldLaunchAfterVrDialogSave(gameId)
 
@@ -1277,7 +1277,7 @@ class SteamAppScreen : BaseAppScreen() {
                                 customArgs = customArgs,
                                 promptEveryLaunch = promptEveryLaunch,
                             )
-                            XrRuntimeManager.setOpenCompositeEnabled(container, openCompositeEnabled)
+                            XrRuntimeManager.setOpenCompositeEnabled(context, container, openCompositeEnabled)
                             hideVrLaunchDialog(gameId)
                             if (launchAfterSave) {
                                 onClickPlay(false)

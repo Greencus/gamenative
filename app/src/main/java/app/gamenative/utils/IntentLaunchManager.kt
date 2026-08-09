@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import app.gamenative.PrefManager
 import app.gamenative.data.GameSource
+import app.gamenative.xr.XrContainerSettings
 import com.winlator.container.Container
 import com.winlator.container.ContainerData
 import com.winlator.core.DXVKHelper
@@ -77,7 +78,7 @@ object IntentLaunchManager {
 
                 // Backup original config before applying override (only once)
                 if (TemporaryConfigStore.getOriginalConfig(appId) == null) {
-                    val originalConfig = ContainerUtils.toContainerData(container)
+        val originalConfig = ContainerUtils.toContainerData(context, container)
                     TemporaryConfigStore.setOriginalConfig(appId, originalConfig)
                 }
 
@@ -100,7 +101,7 @@ object IntentLaunchManager {
         return try {
             val baseConfig = if (ContainerUtils.hasContainer(context, appId)) {
                 val container = ContainerUtils.getContainer(context, appId)
-                ContainerUtils.toContainerData(container)
+                ContainerUtils.toContainerData(context, container)
             } else {
                 null
             }
@@ -257,7 +258,7 @@ object IntentLaunchManager {
         // Quick return if no actual overrides
         if (override == base) return base
 
-        return ContainerData(
+        val merged = ContainerData(
             name = override.name.ifEmpty { base.name },
             screenSize = if (override.screenSize != Container.DEFAULT_SCREEN_SIZE) {
                 override.screenSize
@@ -327,6 +328,7 @@ object IntentLaunchManager {
             shaderBackend = if (override.shaderBackend != "glsl") override.shaderBackend else base.shaderBackend,
             useGLSL = if (override.useGLSL != "enabled") override.useGLSL else base.useGLSL,
         )
+        return XrContainerSettings.preserveFrom(base, merged)
     }
 }
 

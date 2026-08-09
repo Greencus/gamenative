@@ -773,7 +773,7 @@ override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean =
 
     override fun loadContainerData(context: Context, libraryItem: LibraryItem): ContainerData {
         val container = ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
-        return ContainerUtils.toContainerData(container)
+        return ContainerUtils.toContainerData(context, container)
     }
 
     override fun saveContainerConfig(

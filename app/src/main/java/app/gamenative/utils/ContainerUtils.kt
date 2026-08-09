@@ -10,6 +10,7 @@ import app.gamenative.service.SteamService
 import app.gamenative.service.amazon.AmazonService
 import app.gamenative.service.epic.EpicService
 import app.gamenative.service.gog.GOGService
+import app.gamenative.xr.XrContainerSettings
 import com.winlator.container.Container
 import com.winlator.container.ContainerData
 import com.winlator.container.ContainerManager
@@ -366,12 +367,69 @@ object ContainerUtils {
             // LSFG Vulkan frame generation
             lsfgEnabled = container.getExtra(LsfgVkManager.EXTRA_ARMED, "false").toBoolean(),
             bionicFgEnabled = container.getExtra(BionicFgManager.EXTRA_ARMED, "false").toBoolean(),
+            xrRenderScale = XrContainerSettings.sanitizeRenderScale(
+                container.getExtra(
+                    XrContainerSettings.RENDER_SCALE_EXTRA,
+                    XrContainerSettings.DEFAULT_RENDER_SCALE.toString(),
+                ).toIntOrNull(),
+            ),
+            xrOpenCompositeEnabled = container.getExtra(
+                XrContainerSettings.OPENCOMPOSITE_EXTRA,
+                "true",
+            ).toBooleanStrictOrNull() != false,
+            xrTheaterScreenEnabled = container.getExtra(
+                XrContainerSettings.THEATER_SCREEN_EXTRA,
+                "true",
+            ).toBooleanStrictOrNull() != false,
+            xrClockEnabled = container.getExtra(
+                XrContainerSettings.CLOCK_EXTRA,
+                "true",
+            ).toBooleanStrictOrNull() != false,
+        )
+    }
+
+    /** Load container data for an editor, overlaying the durable per-app VR preferences. */
+    fun toContainerData(context: Context, container: Container): ContainerData {
+        val data = toContainerData(container)
+        val xr = XrContainerSettings.read(context, container.id, container)
+        return data.copy(
+            xrRenderScale = xr.renderScale,
+            xrOpenCompositeEnabled = xr.openCompositeEnabled,
+            xrTheaterScreenEnabled = xr.theaterScreenEnabled,
+            xrClockEnabled = xr.clockEnabled,
         )
     }
 
     fun applyToContainer(context: Context, appId: String, containerData: ContainerData) {
         val container = getContainer(context, appId)
         applyToContainer(context, container, containerData)
+    }
+
+    /** Persist only the per-container VR settings without running the full container update. */
+    fun applyXrSettings(context: Context, appId: String, containerData: ContainerData) {
+        val container = getContainer(context, appId)
+        val requested = XrContainerSettings.from(containerData)
+        check(XrContainerSettings.persist(context, appId, requested)) {
+            "Could not persist VR settings for $appId"
+        }
+        XrContainerSettings.write(container, requested)
+        container.putExtra("config_changed", "true")
+        container.saveData()
+
+        val reloadedContainer = getContainer(context, appId)
+        val persisted = XrContainerSettings.read(context, appId, reloadedContainer)
+        val mirrored = XrContainerSettings.read(reloadedContainer)
+        if (persisted != requested || mirrored != requested) {
+            Timber.e(
+                "VR settings verification failed for %s: requested=%s persisted=%s mirrored=%s",
+                appId,
+                requested,
+                persisted,
+                mirrored,
+            )
+            throw IllegalStateException("Could not persist VR settings for $appId")
+        }
+        Timber.i("Saved VR settings for %s: %s", appId, persisted)
     }
 
     /**
@@ -594,6 +652,14 @@ object ContainerUtils {
         Timber.d("Container set: preferredInputApi=%s, dinputMapperType=0x%02x", api, containerData.dinputMapperType)
 
         if (saveToDisk) {
+            // VR preferences belong to the persisted container configuration. Temporary launch
+            // overrides also call this method with saveToDisk=false and the same Container
+            // instance; changing these extras there lets later launch-time saveData() calls
+            // accidentally persist override defaults over the user's VR settings.
+            XrContainerSettings.write(
+                container,
+                XrContainerSettings.read(context, container.id, container),
+            )
             // Mark that config has been changed, so we can show feedback dialog after next game run
             container.putExtra("config_changed", "true")
             container.saveData()
@@ -1109,7 +1175,7 @@ object ContainerUtils {
                 if (overrideConfig != null) {
                     // Backup original config before applying override (if not already backed up)
                     if (IntentLaunchManager.getOriginalConfig(appId) == null) {
-                        val originalConfig = toContainerData(container)
+                        val originalConfig = toContainerData(context, container)
                         IntentLaunchManager.setOriginalConfig(appId, originalConfig)
                     }
 

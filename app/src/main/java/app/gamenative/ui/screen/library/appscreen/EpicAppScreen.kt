@@ -541,7 +541,7 @@ class EpicAppScreen : BaseAppScreen() {
         Timber.tag(TAG).d("loadContainerData: appId=${libraryItem.appId}")
         // Load Epic-specific container data using ContainerUtils
         val container = app.gamenative.utils.ContainerUtils.getOrCreateContainer(context, libraryItem.appId)
-        val containerData = app.gamenative.utils.ContainerUtils.toContainerData(container)
+        val containerData = app.gamenative.utils.ContainerUtils.toContainerData(context, container)
         Timber.tag(TAG).d("loadContainerData: loaded container for ${libraryItem.appId}")
         return containerData
     }

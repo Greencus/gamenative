@@ -583,6 +583,7 @@ static int gn_stopping_pushed = 0;
 static int gn_winsock_started = 0;
 static gn_socket gn_bridge_socket = GN_INVALID_SOCKET;
 static int gn_bridge_ever_connected = 0;
+static int gn_frame_milestone_sent = 0;
 static XrSessionState gn_event_states[16];
 static gn_uint32 gn_event_head = 0;
 static gn_uint32 gn_event_tail = 0;
@@ -2203,7 +2204,8 @@ static XrResult XRAPI_CALL gn_xrBeginFrame(XrSession session, const XrFrameBegin
     if (session != gn_session) return XR_ERROR_HANDLE_INVALID;
     if (!frameBeginInfo || frameBeginInfo->type != XR_TYPE_FRAME_BEGIN_INFO)
         return XR_ERROR_VALIDATION_FAILURE;
-    gn_bridge_call("BEGIN_FRAME", NULL, 0);
+    /* BEGIN_FRAME carried no state. Avoid a synchronous TCP round trip in the
+     * hottest part of every game frame. xrWaitFrame is the pacing boundary. */
     return XR_SUCCESS;
 }
 
@@ -2336,10 +2338,14 @@ static XrResult XRAPI_CALL gn_xrEndFrame(XrSession session, const XrFrameEndInfo
     if (gn_gfx_api == GN_GFX_D3D11) gn_dxvk_unlock();
     if (gn_gfx_api == GN_GFX_D3D12) gn_vkd3d_unlock();
 
-    char cmd[64];
-    gn_size n = gn_append(cmd, sizeof(cmd), 0, "END_FRAME layers=");
-    n = gn_append_i64(cmd, sizeof(cmd), n, (long long)frameEndInfo->layerCount);
-    gn_bridge_call(cmd, NULL, 0);
+    /* The Java END_FRAME command is diagnostic only. Publish its first-frame
+     * milestone once instead of stalling every submitted frame on loopback TCP. */
+    if (!gn_frame_milestone_sent && frameEndInfo->layerCount > 0) {
+        char cmd[64];
+        gn_size n = gn_append(cmd, sizeof(cmd), 0, "END_FRAME layers=");
+        n = gn_append_i64(cmd, sizeof(cmd), n, (long long)frameEndInfo->layerCount);
+        if (gn_bridge_call(cmd, NULL, 0)) gn_frame_milestone_sent = 1;
+    }
     return submission_failed ? XR_ERROR_RUNTIME_FAILURE : XR_SUCCESS;
 }
 
@@ -2451,8 +2457,16 @@ static XrResult XRAPI_CALL gn_xrLocateViews(
 static XrResult XRAPI_CALL gn_xrEnumerateSwapchainFormats(XrSession session, gn_uint32 capacity, gn_uint32* count, int64_t* formats) {
     if (session != gn_session) return XR_ERROR_HANDLE_INVALID;
     /* Formats are graphics-API-specific; pick the list matching the negotiated binding. */
-    static const int64_t vk_formats[] = {43 /*R8G8B8A8_SRGB*/, 37 /*R8G8B8A8_UNORM*/, 50 /*B8G8R8A8_SRGB*/, 44 /*B8G8R8A8_UNORM*/};
-    static const int64_t d3d_formats[] = {29 /*DXGI R8G8B8A8_UNORM_SRGB*/, 28 /*R8G8B8A8_UNORM*/, 91 /*B8G8R8A8_UNORM_SRGB*/, 87 /*B8G8R8A8_UNORM*/};
+    /*
+     * Prefer BGRA on Android.  Turnip exports B8G8R8A8 as DRM AR24, which
+     * the Quest Adreno EGL driver accepts for dma-buf import.  Its otherwise
+     * equivalent R8G8B8A8 export is DRM AB24 and is rejected with
+     * EGL_BAD_MATCH on the same device.  Keep RGBA in the list for clients
+     * which require it, but let engines which choose the first runtime format
+     * (including Unity) take the zero-copy-compatible path.
+     */
+    static const int64_t vk_formats[] = {50 /*B8G8R8A8_SRGB*/, 44 /*B8G8R8A8_UNORM*/, 43 /*R8G8B8A8_SRGB*/, 37 /*R8G8B8A8_UNORM*/};
+    static const int64_t d3d_formats[] = {91 /*DXGI B8G8R8A8_UNORM_SRGB*/, 87 /*B8G8R8A8_UNORM*/, 29 /*R8G8B8A8_UNORM_SRGB*/, 28 /*R8G8B8A8_UNORM*/};
     const int64_t* list =
         (gn_gfx_api == GN_GFX_D3D11 || gn_gfx_api == GN_GFX_D3D12) ?
         d3d_formats : vk_formats;
@@ -2646,6 +2660,8 @@ static XrResult XRAPI_CALL gn_xrCreateSwapchain(XrSession session, const XrSwapc
     args.format = (gn_gfx_api == GN_GFX_D3D11 || gn_gfx_api == GN_GFX_D3D12) ?
         gn_d3d_format_to_vk(createInfo->format) : createInfo->format;
     if (!args.format) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+    gn_log_num("xrCreateSwapchain client format=", createInfo->format);
+    gn_log_num("xrCreateSwapchain Vulkan format=", args.format);
     args.usage = createInfo->usageFlags;
     args.result = GN_UNIX_ERROR_UNAVAILABLE;
     if (!gn_unix_call(GN_UNIX_CREATE_SWAPCHAIN, &args) ||

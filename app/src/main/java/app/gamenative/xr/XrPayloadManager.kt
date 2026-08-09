@@ -47,7 +47,7 @@ object XrPayloadManager {
 
     suspend fun prepare(context: Context, container: Container, appId: String) = withContext(Dispatchers.IO) {
         prepareBridgePayload(context, container)
-        if (XrRuntimeManager.isOpenCompositeEnabled(container)) {
+        if (XrRuntimeManager.isOpenCompositeEnabled(context, container)) {
             prepareOpenComposite(context, container, appId)
         } else {
             restorePerGameOpenComposite(container, appId)

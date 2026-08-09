@@ -133,7 +133,7 @@ object ContainerConfigTransfer {
                                 }
 
                                 val container = ContainerUtils.getOrCreateContainer(context, appId)
-                                val currentData = ContainerUtils.toContainerData(container)
+                                val currentData = ContainerUtils.toContainerData(context, container)
                                 val updatedData = ContainerUtils.applyBestConfigMapToContainerData(currentData, forced)
                                 ContainerUtils.applyToContainer(context, container, updatedData)
                                 SnackbarManager.show(context.getString(R.string.best_config_applied_with_defaults))
@@ -192,7 +192,7 @@ object ContainerConfigTransfer {
             // 3) Apply to container using the same mapping logic as BestConfig
             withContext(Dispatchers.IO) {
                 val container = ContainerUtils.getOrCreateContainer(context, appId)
-                val currentData = ContainerUtils.toContainerData(container)
+                val currentData = ContainerUtils.toContainerData(context, container)
                 val updatedData = ContainerUtils.applyBestConfigMapToContainerData(currentData, bestConfigMap)
                 ContainerUtils.applyToContainer(context, container, updatedData)
             }
