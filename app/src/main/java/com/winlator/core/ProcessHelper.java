@@ -317,10 +317,13 @@ public abstract class ProcessHelper {
             pid = pidField.getInt(process);
             pidField.setAccessible(false);
 
-            if (!debugCallbacks.isEmpty()) {
-                createDebugThread(process.getInputStream());
-                createDebugThread(process.getErrorStream());
-            }
+            // Runtime.exec() always creates pipes for stdout and stderr. They must be
+            // drained even when logging is disabled; otherwise a sufficiently chatty
+            // Wine child fills the kernel pipe buffer and blocks in pipe_write before
+            // the game can initialize. The drain thread discards output cheaply when
+            // there are no diagnostic callbacks.
+            createDebugThread(process.getInputStream());
+            createDebugThread(process.getErrorStream());
 //            Uncomment the following lines to see logs from wine
 //            createDebugThread(process.getInputStream(), "STDOUT", pid);
 //            createDebugThread(process.getErrorStream(), "STDERR", pid);
@@ -344,10 +347,8 @@ public abstract class ProcessHelper {
             }
 
             java.lang.Process process = Runtime.getRuntime().exec(splitCommand(command), envp, workingDir);
-            if (!debugCallbacks.isEmpty()) {
-                createDebugThread(process.getInputStream());
-                createDebugThread(process.getErrorStream());
-            }
+            createDebugThread(process.getInputStream());
+            createDebugThread(process.getErrorStream());
 
             return process;
         } catch (Exception e) {
@@ -415,13 +416,13 @@ public abstract class ProcessHelper {
     }
 
     private static void createDebugThread(final InputStream inputStream) {
-        Executors.newSingleThreadExecutor().execute(() -> {
+        Thread drainThread = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (PRINT_DEBUG) System.out.println(line);
                     synchronized (debugCallbacks) {
                         if (!debugCallbacks.isEmpty()) {
+                            if (PRINT_DEBUG) System.out.println(line);
                             for (Callback<String> callback : debugCallbacks) callback.call(line);
                         }
                     }
@@ -433,7 +434,9 @@ public abstract class ProcessHelper {
             catch (IOException e) {
                 Log.e("ProcessHelper", "Error on debug thread: " + e);
             }
-        });
+        }, "process-output-drain");
+        drainThread.setDaemon(true);
+        drainThread.start();
     }
 
     private static void createDebugThread(final InputStream inputStream, final String streamType, final int pid) {
