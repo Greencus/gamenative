@@ -17,6 +17,7 @@ index 688d1fbeab6..5fd6dd5b9d1 100644
 +        {
 +            "VK_KHR_external_memory",
 +            "VK_KHR_external_memory_fd",
++            "VK_ANDROID_external_memory_android_hardware_buffer",
 +            "VK_EXT_external_memory_dma_buf",
 +            "VK_EXT_image_drm_format_modifier",
 +            "VK_KHR_external_fence",

@@ -3,9 +3,9 @@
 // This is the data-plane half of the "true stereo" bridge described in
 // docs/xr/true-stereo-bridge-design.md (milestone M1).
 //
-// The Wine Unix producer allocates swapchain images once, exports dma-buf fds once
-// per eye/array-layer registration, and then exchanges only image indices, sub-rects,
-// and native fences per frame. The in-process synthetic producer uses AHardwareBuffer.
+// The Wine Unix producer allocates swapchain images once and prefers one importable
+// AHardwareBuffer per eye/image slot. It exchanges only image indices, sub-rects,
+// and native fences per frame. dma-buf remains the compatibility fallback.
 //
 // This module owns the AF_UNIX listener and the imported AHardwareBuffer slots. It is
 // deliberately decoupled from GL: receiving a handle needs no GL context, so it runs on
@@ -27,8 +27,8 @@
 
 namespace gamenative::xr {
 
-// How an eye's GPU buffer was shared. AHardwareBuffer is used by the in-process test
-// producer; DmaBuf is the real game path (Turnip/glibc side exports a dma-buf fd).
+// How an eye's GPU buffer was shared. HardwareBuffer is the preferred Android path;
+// DmaBuf is retained for Vulkan stacks which cannot import AHardwareBuffer memory.
 enum class BufferKind { None, HardwareBuffer, DmaBuf };
 
 // A single eye's most-recently-presented buffer. All handles are owned by the transport;
@@ -40,6 +40,9 @@ struct EyeFrame {
 
     // kind == HardwareBuffer: AHardwareBuffer_acquire'd on receipt.
     AHardwareBuffer* buffer{nullptr};
+    // The Vulkan producer may copy a BGRA swapchain into the only portable Android
+    // RGBA hardware-buffer format. In that case GL samples with R/B swizzled.
+    bool swapRedBlue{false};
 
     // kind == DmaBuf: one to four dma-buf planes + DRM layout. Fds stay open for the
     // registered buffer's lifetime (EGL duplicates them on import).
@@ -110,7 +113,8 @@ private:
     bool handleDmabufLine(int clientFd, const std::string& line);
     bool handleFrameLine(int clientFd, const std::string& line);
     bool handleAcquireLine(int clientFd, const std::string& line);
-    void storeEyeBuffer(int eye, AHardwareBuffer* ahb, int32_t w, int32_t h, int32_t index);
+    void storeEyeBuffer(int eye, AHardwareBuffer* ahb, int32_t w, int32_t h,
+                        int32_t index, bool swapRedBlue);
     void storeEyeDmabuf(int eye, const EyeFrame& incoming);
     void releaseSlotLocked(int eye, int imageIndex);  // caller holds eyesMutex_
     void releaseEye(int eye);

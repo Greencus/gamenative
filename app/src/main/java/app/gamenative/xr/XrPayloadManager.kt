@@ -283,16 +283,17 @@ object XrPayloadManager {
     }
 
     /**
-     * Wine intentionally hides Linux dma-buf and sync-file extensions from a
-     * Windows Vulkan application. The version-pinned module keeps those
-     * extensions hidden while enabling them on Wine's host VkDevice for the XR
-     * unixlib. Its behavior is gated by GAMENATIVE_XR, so non-XR launches use
-     * the normal Wine path even though the module is installed globally.
+     * Wine intentionally hides Android/Linux external-memory and sync-file
+     * extensions from a Windows Vulkan application. The version-pinned module
+     * keeps those extensions hidden while enabling AHardwareBuffer, dma-buf,
+     * and fence interop on Wine's host VkDevice for the XR unixlib. Its behavior
+     * is gated by GAMENATIVE_XR, so non-XR launches use the normal Wine path even
+     * though the module is installed globally.
      */
     private fun prepareWineVulkanInterop(context: Context, container: Container, wineDir: File) {
         if (container.wineVersion != PATCHED_WINE_IDENTIFIER) {
             Timber.w(
-                "GameNativeVR dma-buf producer interop is version-pinned to %s; current Wine is %s",
+                "GameNativeVR zero-copy producer interop is version-pinned to %s; current Wine is %s",
                 PATCHED_WINE_IDENTIFIER,
                 container.wineVersion,
             )

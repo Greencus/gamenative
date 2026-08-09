@@ -1,0 +1,2 @@
+tools/xr/*.sh text eol=lf
+app/src/main/windows/openxr_bridge/unix/*.sh text eol=lf

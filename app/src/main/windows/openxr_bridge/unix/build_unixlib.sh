@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep this script LF-only: it is invoked directly by bash inside WSL.
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../../../../.." && pwd)"
 toolchain_root="${GN_WINE_TOOLCHAIN_ROOT:-$HOME/projects/gamenative-wine-toolchain/root}"

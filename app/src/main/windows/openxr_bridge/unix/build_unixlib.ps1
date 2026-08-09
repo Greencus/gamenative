@@ -18,7 +18,7 @@ New-Item -ItemType Directory -Force -Path $armOutputDir | Out-Null
     -Wall -Wextra -Werror `
     -I (Join-Path $ndkRoot "toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\include") `
     -o (Join-Path $armOutputDir "gamenative_openxr.so") `
-    $source -ldl
+    $source -ldl -landroid
 if ($LASTEXITCODE -ne 0) {
     throw "aarch64 unixlib build failed with exit code $LASTEXITCODE"
 }

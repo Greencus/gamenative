@@ -1,6 +1,10 @@
 #define _GNU_SOURCE
 #include "../gamenative_openxr_unix.h"
 
+#if defined(__ANDROID__)
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#include <android/hardware_buffer.h>
+#endif
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
@@ -24,6 +28,21 @@
 
 typedef int32_t (*unixlib_entry_t)(void *);
 
+enum gn_transport_kind {
+    GN_TRANSPORT_UNKNOWN = 0,
+    GN_TRANSPORT_AHARDWAREBUFFER = 1,
+    GN_TRANSPORT_DMABUF = 2
+};
+
+struct gn_transport_image {
+    VkImage image;
+    VkDeviceMemory memory;
+    VkCommandBuffer command_buffer;
+    void *hardware_buffer;
+    uint8_t registered;
+    uint8_t initialized;
+};
+
 struct wine_client_object {
     uint64_t loader_magic;
     uint64_t unix_handle;
@@ -39,6 +58,8 @@ struct gn_image {
     uint64_t modifier;
     uint8_t registered_eye_mask;
     uint32_t registered_array_index[2];
+    uint8_t transport_kind[2];
+    struct gn_transport_image transport[2];
     uint8_t submitted;
 };
 
@@ -48,6 +69,7 @@ struct gn_swapchain {
     uint32_t height;
     VkFormat format;
     uint32_t array_size;
+    uint32_t sample_count;
     uint32_t image_count;
     struct gn_image images[GN_UNIX_MAX_IMAGES];
 };
@@ -58,6 +80,8 @@ static struct gn_swapchain swapchains[GN_UNIX_MAX_SWAPCHAINS];
 static VkPhysicalDevice physical_device;
 static VkDevice device;
 static VkQueue queue;
+static uint32_t queue_family_index;
+static VkCommandPool command_pool;
 static void *vulkan_so;
 static int transport_fd = -1;
 static uint8_t transport_frame_announced[2];
@@ -79,6 +103,19 @@ static PFN_vkDestroyFence p_vkDestroyFence;
 static PFN_vkGetFenceFdKHR p_vkGetFenceFdKHR;
 static PFN_vkQueueSubmit p_vkQueueSubmit;
 static PFN_vkQueueWaitIdle p_vkQueueWaitIdle;
+static PFN_vkCreateCommandPool p_vkCreateCommandPool;
+static PFN_vkDestroyCommandPool p_vkDestroyCommandPool;
+static PFN_vkAllocateCommandBuffers p_vkAllocateCommandBuffers;
+static PFN_vkFreeCommandBuffers p_vkFreeCommandBuffers;
+static PFN_vkResetCommandBuffer p_vkResetCommandBuffer;
+static PFN_vkBeginCommandBuffer p_vkBeginCommandBuffer;
+static PFN_vkEndCommandBuffer p_vkEndCommandBuffer;
+static PFN_vkCmdPipelineBarrier p_vkCmdPipelineBarrier;
+static PFN_vkCmdCopyImage p_vkCmdCopyImage;
+#if defined(__ANDROID__)
+static PFN_vkGetAndroidHardwareBufferPropertiesANDROID
+    p_vkGetAndroidHardwareBufferPropertiesANDROID;
+#endif
 
 static void log_line(const char *line)
 {
@@ -95,11 +132,19 @@ static void log_vulkan_context_state(void)
     char line[384];
     snprintf(line, sizeof(line),
              "Vulkan context phys=%p device=%p queue=%p gpa=%p createImage=%p "
-             "getMemoryFd=%p createFence=%p getFenceFd=%p queueSubmit=%p",
+             "getMemoryFd=%p createFence=%p getFenceFd=%p queueSubmit=%p "
+             "commandPool=%p ahb=%p",
              (void *)physical_device, (void *)device, (void *)queue,
              (void *)p_vkGetDeviceProcAddr, (void *)p_vkCreateImage,
              (void *)p_vkGetMemoryFdKHR, (void *)p_vkCreateFence,
-             (void *)p_vkGetFenceFdKHR, (void *)p_vkQueueSubmit);
+             (void *)p_vkGetFenceFdKHR, (void *)p_vkQueueSubmit,
+             (void *)command_pool,
+#if defined(__ANDROID__)
+             (void *)p_vkGetAndroidHardwareBufferPropertiesANDROID
+#else
+             NULL
+#endif
+    );
     log_line(line);
 }
 
@@ -397,7 +442,19 @@ static void load_vulkan_functions(void)
     LOAD_DEVICE(vkDestroyFence);
     LOAD_DEVICE(vkGetFenceFdKHR);
     LOAD_DEVICE(vkQueueSubmit);
-      LOAD_DEVICE(vkQueueWaitIdle);
+    LOAD_DEVICE(vkQueueWaitIdle);
+    LOAD_DEVICE(vkCreateCommandPool);
+    LOAD_DEVICE(vkDestroyCommandPool);
+    LOAD_DEVICE(vkAllocateCommandBuffers);
+    LOAD_DEVICE(vkFreeCommandBuffers);
+    LOAD_DEVICE(vkResetCommandBuffer);
+    LOAD_DEVICE(vkBeginCommandBuffer);
+    LOAD_DEVICE(vkEndCommandBuffer);
+    LOAD_DEVICE(vkCmdPipelineBarrier);
+    LOAD_DEVICE(vkCmdCopyImage);
+#if defined(__ANDROID__)
+    LOAD_DEVICE(vkGetAndroidHardwareBufferPropertiesANDROID);
+#endif
 #undef LOAD_DEVICE
     /*
      * winevulkan intentionally hides Linux handle extensions from the Windows
@@ -412,6 +469,9 @@ static void load_vulkan_functions(void)
     LOAD_HOST_TRAMPOLINE(vkGetImageDrmFormatModifierPropertiesEXT);
     LOAD_HOST_TRAMPOLINE(vkGetMemoryFdKHR);
     LOAD_HOST_TRAMPOLINE(vkGetFenceFdKHR);
+#if defined(__ANDROID__)
+    LOAD_HOST_TRAMPOLINE(vkGetAndroidHardwareBufferPropertiesANDROID);
+#endif
 #undef LOAD_HOST_TRAMPOLINE
 }
 
@@ -639,13 +699,330 @@ fail:
     return 0;
 }
 
+static void destroy_transport_image(struct gn_transport_image *transport)
+{
+    if (transport->command_buffer && command_pool && p_vkFreeCommandBuffers)
+        p_vkFreeCommandBuffers(device, command_pool, 1, &transport->command_buffer);
+    if (transport->image && p_vkDestroyImage)
+        p_vkDestroyImage(device, transport->image, NULL);
+    if (transport->memory && p_vkFreeMemory)
+        p_vkFreeMemory(device, transport->memory, NULL);
+#if defined(__ANDROID__)
+    if (transport->hardware_buffer)
+        AHardwareBuffer_release((AHardwareBuffer *)transport->hardware_buffer);
+#endif
+    memset(transport, 0, sizeof(*transport));
+}
+
+#if defined(__ANDROID__)
+static int create_ahardwarebuffer_transport(
+    const struct gn_swapchain *swapchain, struct gn_transport_image *transport)
+{
+    if (!p_vkGetAndroidHardwareBufferPropertiesANDROID || !command_pool ||
+        !p_vkAllocateCommandBuffers || !p_vkResetCommandBuffer ||
+        !p_vkBeginCommandBuffer || !p_vkEndCommandBuffer ||
+        !p_vkCmdPipelineBarrier || !p_vkCmdCopyImage || !p_vkQueueSubmit)
+        return 0;
+
+    AHardwareBuffer_Desc descriptor = {
+        .width = swapchain->width,
+        .height = swapchain->height,
+        .layers = 1,
+        .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+        .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                 AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
+    };
+    AHardwareBuffer *buffer = NULL;
+    if (AHardwareBuffer_allocate(&descriptor, &buffer) != 0 || !buffer) {
+        log_line("AHardwareBuffer allocation unavailable; using dma-buf fallback");
+        return 0;
+    }
+    transport->hardware_buffer = buffer;
+
+    VkAndroidHardwareBufferFormatPropertiesANDROID format_properties = {
+        .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID
+    };
+    VkAndroidHardwareBufferPropertiesANDROID properties = {
+        .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
+        .pNext = &format_properties
+    };
+    VkResult result = p_vkGetAndroidHardwareBufferPropertiesANDROID(
+        device, buffer, &properties);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkGetAndroidHardwareBufferPropertiesANDROID", result);
+        goto fail;
+    }
+    if (format_properties.format != VK_FORMAT_R8G8B8A8_UNORM) {
+        char trace[160];
+        snprintf(trace, sizeof(trace),
+                 "AHardwareBuffer returned unsupported Vulkan format=%d",
+                 (int)format_properties.format);
+        log_line(trace);
+        goto fail;
+    }
+
+    VkExternalMemoryImageCreateInfo external = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
+    };
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &external,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {swapchain->width, swapchain->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+    result = p_vkCreateImage(device, &image_info, NULL, &transport->image);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkCreateImage(AHardwareBuffer)", result);
+        goto fail;
+    }
+
+    VkMemoryRequirements requirements;
+    p_vkGetImageMemoryRequirements(device, transport->image, &requirements);
+    const uint32_t compatible_types =
+        requirements.memoryTypeBits & properties.memoryTypeBits;
+    int memory_type = find_memory_type(compatible_types, 0);
+    if (memory_type < 0) {
+        log_line("No compatible memory type for AHardwareBuffer image");
+        goto fail;
+    }
+    VkImportAndroidHardwareBufferInfoANDROID import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+        .buffer = buffer
+    };
+    VkMemoryDedicatedAllocateInfo dedicated = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .image = transport->image
+    };
+    VkMemoryAllocateInfo allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &dedicated,
+        .allocationSize = properties.allocationSize,
+        .memoryTypeIndex = (uint32_t)memory_type
+    };
+    result = p_vkAllocateMemory(
+        device, &allocate_info, NULL, &transport->memory);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkAllocateMemory(AHardwareBuffer)", result);
+        goto fail;
+    }
+    result = p_vkBindImageMemory(
+        device, transport->image, transport->memory, 0);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkBindImageMemory(AHardwareBuffer)", result);
+        goto fail;
+    }
+
+    VkCommandBufferAllocateInfo command_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    result = p_vkAllocateCommandBuffers(
+        device, &command_info, &transport->command_buffer);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkAllocateCommandBuffers(AHardwareBuffer)", result);
+        goto fail;
+    }
+    log_line("AHardwareBuffer Vulkan transport image created");
+    return 1;
+
+fail:
+    destroy_transport_image(transport);
+    return 0;
+}
+
+static int submit_ahardwarebuffer_copy(
+    const struct gn_swapchain *swapchain, const struct gn_image *source,
+    struct gn_transport_image *transport, uint32_t array_index)
+{
+    VkResult result = p_vkResetCommandBuffer(transport->command_buffer, 0);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkResetCommandBuffer(AHardwareBuffer)", result);
+        return 0;
+    }
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    result = p_vkBeginCommandBuffer(transport->command_buffer, &begin);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkBeginCommandBuffer(AHardwareBuffer)", result);
+        return 0;
+    }
+
+    VkImageMemoryBarrier before[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = source->image,
+            .subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, array_index, 1
+            }
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = transport->initialized ? VK_ACCESS_MEMORY_READ_BIT : 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = transport->initialized ?
+                VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = transport->initialized ?
+                VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = transport->initialized ?
+                queue_family_index : VK_QUEUE_FAMILY_IGNORED,
+            .image = transport->image,
+            .subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
+            }
+        }
+    };
+    p_vkCmdPipelineBarrier(
+        transport->command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, before);
+
+    VkImageCopy copy = {
+        .srcSubresource = {
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1
+        },
+        .dstSubresource = {
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1
+        },
+        .extent = {swapchain->width, swapchain->height, 1}
+    };
+    p_vkCmdCopyImage(
+        transport->command_buffer, source->image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transport->image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    VkImageMemoryBarrier after[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = source->image,
+            .subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, array_index, 1
+            }
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = queue_family_index,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = transport->image,
+            .subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
+            }
+        }
+    };
+    p_vkCmdPipelineBarrier(
+        transport->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 2, after);
+    result = p_vkEndCommandBuffer(transport->command_buffer);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkEndCommandBuffer(AHardwareBuffer)", result);
+        return 0;
+    }
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &transport->command_buffer
+    };
+    result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        log_vk_result("vkQueueSubmit(AHardwareBuffer copy)", result);
+        return 0;
+    }
+    transport->initialized = 1;
+    return 1;
+}
+#endif
+
 static void destroy_image(struct gn_image *image)
 {
+    for (uint32_t eye = 0; eye < 2; ++eye)
+        destroy_transport_image(&image->transport[eye]);
     if (image->dma_buf_fd >= 0) close(image->dma_buf_fd);
     if (image->image && p_vkDestroyImage) p_vkDestroyImage(device, image->image, NULL);
     if (image->memory && p_vkFreeMemory) p_vkFreeMemory(device, image->memory, NULL);
     memset(image, 0, sizeof(*image));
     image->dma_buf_fd = -1;
+}
+
+static int register_ahardwarebuffer(
+    uint32_t slot, uint32_t image_index, uint32_t eye)
+{
+#if defined(__ANDROID__)
+    struct gn_swapchain *swapchain = &swapchains[slot];
+    struct gn_image *image = &swapchain->images[image_index];
+    struct gn_transport_image *transport = &image->transport[eye];
+    if (swapchain->sample_count != 1) return 0;
+    if (!transport->hardware_buffer &&
+        !create_ahardwarebuffer_transport(swapchain, transport)) return 0;
+    if (transport->registered) return 1;
+
+    const uint32_t transport_index = slot * GN_UNIX_MAX_IMAGES + image_index;
+    const int swap_red_blue =
+        swapchain->format == VK_FORMAT_B8G8R8A8_UNORM ||
+        swapchain->format == VK_FORMAT_B8G8R8A8_SRGB;
+    char line[192], response[64] = {0};
+    snprintf(line, sizeof(line),
+             "BUFFER eye=%u index=%u w=%u h=%u swizzle=%u\n",
+             eye, transport_index, swapchain->width, swapchain->height,
+             swap_red_blue ? 1u : 0u);
+    if (!transact_line(line, response, sizeof(response)) ||
+        strncmp(response, "OK", 2) ||
+        AHardwareBuffer_sendHandleToUnixSocket(
+            (AHardwareBuffer *)transport->hardware_buffer,
+            transport_fd) != 0 ||
+        !read_line(transport_fd, response, sizeof(response)) ||
+        strncmp(response, "OK", 2)) {
+        log_line("AHardwareBuffer registration failed; using dma-buf fallback");
+        close_transport();
+        return 0;
+    }
+    transport->registered = 1;
+    {
+        char trace[192];
+        snprintf(trace, sizeof(trace),
+                 "AHardwareBuffer registered eye=%u index=%u size=%ux%u swizzle=%u",
+                 eye, transport_index, swapchain->width, swapchain->height,
+                 swap_red_blue ? 1u : 0u);
+        log_line(trace);
+    }
+    return 1;
+#else
+    (void)slot;
+    (void)image_index;
+    (void)eye;
+    return 0;
+#endif
 }
 
 static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
@@ -657,6 +1034,21 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     if (array_index >= swapchain->array_size) return 0;
     if ((image->registered_eye_mask & bit) &&
         image->registered_array_index[eye] == array_index) return 1;
+
+    if (image->transport_kind[eye] == GN_TRANSPORT_UNKNOWN) {
+        if (register_ahardwarebuffer(slot, image_index, eye)) {
+            image->transport_kind[eye] = GN_TRANSPORT_AHARDWAREBUFFER;
+            image->registered_eye_mask |= bit;
+            image->registered_array_index[eye] = array_index;
+            return 1;
+        }
+        destroy_transport_image(&image->transport[eye]);
+        image->transport_kind[eye] = GN_TRANSPORT_DMABUF;
+    }
+    if (image->transport_kind[eye] == GN_TRANSPORT_AHARDWAREBUFFER) {
+        image->registered_array_index[eye] = array_index;
+        return 1;
+    }
 
     VkSubresourceLayout layouts[4];
     for (uint32_t plane = 0; plane < image->plane_count; ++plane) {
@@ -796,6 +1188,7 @@ static int32_t unix_set_vulkan_context(void *opaque)
         device = (VkDevice)(uintptr_t)unwrap_dispatchable(args->client_device);
         queue = (VkQueue)(uintptr_t)unwrap_dispatchable(args->client_queue);
     }
+    queue_family_index = args->queue_family_index;
     if (readable_mapping_contains((uintptr_t)physical_device, sizeof(void *)))
         args->diagnostic_flags |= GN_UNIX_VK_DIAG_PHYSICAL_DEVICE;
     if (readable_mapping_contains((uintptr_t)device, sizeof(void *)))
@@ -816,6 +1209,22 @@ static int32_t unix_set_vulkan_context(void *opaque)
         return 0;
     }
     load_vulkan_functions();
+#if defined(__ANDROID__)
+    if (p_vkGetAndroidHardwareBufferPropertiesANDROID &&
+        p_vkCreateCommandPool && !command_pool) {
+        VkCommandPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = queue_family_index
+        };
+        VkResult pool_result = p_vkCreateCommandPool(
+            device, &pool_info, NULL, &command_pool);
+        if (pool_result != VK_SUCCESS) {
+            command_pool = VK_NULL_HANDLE;
+            log_vk_result("vkCreateCommandPool(AHardwareBuffer)", pool_result);
+        }
+    }
+#endif
     if (vulkan_so) args->diagnostic_flags |= GN_UNIX_VK_DIAG_VULKAN_LIBRARY;
     if (p_vkGetDeviceProcAddr)
         args->diagnostic_flags |= GN_UNIX_VK_DIAG_GET_DEVICE_PROC_ADDR;
@@ -850,6 +1259,7 @@ static int32_t unix_create_swapchain(void *opaque)
     swapchain->height = args->height;
     swapchain->format = (VkFormat)args->format;
     swapchain->array_size = args->array_size ? args->array_size : 1;
+    swapchain->sample_count = args->sample_count ? args->sample_count : 1;
     swapchain->image_count = 3; /* Triple buffering covers the requested double-buffer minimum. */
     for (uint32_t i = 0; i < swapchain->image_count; ++i) {
         swapchain->images[i].dma_buf_fd = -1;
@@ -968,6 +1378,27 @@ static int32_t unix_submit_image(void *opaque)
         pthread_mutex_unlock(&socket_mutex);
         return 0;
     }
+#if defined(__ANDROID__)
+    struct gn_image *image =
+        &swapchains[args->slot].images[args->image_index];
+    if (image->transport_kind[args->eye] ==
+            GN_TRANSPORT_AHARDWAREBUFFER &&
+        !submit_ahardwarebuffer_copy(
+            &swapchains[args->slot], image,
+            &image->transport[args->eye], args->array_index)) {
+        const uint8_t bit = (uint8_t)(1u << args->eye);
+        log_line("AHardwareBuffer GPU copy failed; switching image to dma-buf");
+        destroy_transport_image(&image->transport[args->eye]);
+        image->transport_kind[args->eye] = GN_TRANSPORT_DMABUF;
+        image->registered_eye_mask &= (uint8_t)~bit;
+        if (!register_image(args->slot, args->image_index, args->eye,
+                            args->array_index)) {
+            args->result = GN_UNIX_ERROR_TRANSPORT;
+            pthread_mutex_unlock(&socket_mutex);
+            return 0;
+        }
+    }
+#endif
     int fence_fd = make_acquire_fence_fd();
     char line[512], response[64] = {0};
     const uint32_t transport_index =
@@ -1048,4 +1479,13 @@ __attribute__((destructor))
 static void unix_shutdown(void)
 {
     close_transport();
+    for (uint32_t slot = 0; slot < GN_UNIX_MAX_SWAPCHAINS; ++slot) {
+        if (!swapchains[slot].allocated) continue;
+        for (uint32_t image = 0;
+             image < swapchains[slot].image_count; ++image)
+            destroy_image(&swapchains[slot].images[image]);
+    }
+    if (command_pool && p_vkDestroyCommandPool)
+        p_vkDestroyCommandPool(device, command_pool, NULL);
+    command_pool = VK_NULL_HANDLE;
 }

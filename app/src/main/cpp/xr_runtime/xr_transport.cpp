@@ -284,6 +284,7 @@ bool FrameTransport::handleBufferLine(int clientFd, const std::string& line) {
     long long index = parseKey(line, "index", 0);
     long long w = parseKey(line, "w", 0);
     long long h = parseKey(line, "h", 0);
+    const bool swapRedBlue = parseKey(line, "swizzle", 0) != 0;
     if (eye < 0 || eye >= kEyeCount || index < 0 || index >= kMaxImages ||
         w <= 0 || h <= 0) {
         LOGE("xr transport: bad BUFFER line: %s", line.c_str());
@@ -302,7 +303,7 @@ bool FrameTransport::handleBufferLine(int clientFd, const std::string& line) {
 
     storeEyeBuffer(static_cast<int>(eye), ahb,
                    static_cast<int32_t>(w), static_cast<int32_t>(h),
-                   static_cast<int32_t>(index));
+                   static_cast<int32_t>(index), swapRedBlue);
     LOGI("xr transport: received eye %lld AHB buffer %lldx%lld index=%lld", eye, w, h, index);
     return writeAll(clientFd, "OK stored\n", 10);
 }
@@ -513,7 +514,8 @@ void FrameTransport::releaseSlotLocked(int eye, int imageIndex) {
 }
 
 void FrameTransport::storeEyeBuffer(int eye, AHardwareBuffer* ahb,
-                                    int32_t w, int32_t h, int32_t index) {
+                                    int32_t w, int32_t h, int32_t index,
+                                    bool swapRedBlue) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
     if (latest_[eye].kind != BufferKind::None &&
         latest_[eye].imageIndex == index) {
@@ -526,6 +528,7 @@ void FrameTransport::storeEyeBuffer(int eye, AHardwareBuffer* ahb,
     EyeFrame& slot = buffers_[eye][index];
     slot.kind = BufferKind::HardwareBuffer;
     slot.buffer = ahb;
+    slot.swapRedBlue = swapRedBlue;
     slot.width = w;
     slot.height = h;
     slot.imageIndex = index;

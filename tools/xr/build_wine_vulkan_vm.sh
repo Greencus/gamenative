@@ -19,6 +19,12 @@ fi
 
 if ! grep -q "GameNative's OpenXR unixlib" "$source_dir/dlls/winevulkan/vulkan.c"; then
     (cd "$source_dir" && git apply "$patch_file")
+elif ! grep -q "VK_ANDROID_external_memory_android_hardware_buffer" \
+        "$source_dir/dlls/winevulkan/vulkan.c"; then
+    # Keep an existing incremental worktree in sync when the XR host-only
+    # extension list grows. Fresh worktrees receive the complete patch above.
+    sed -i '/"VK_KHR_external_memory_fd",/a\            "VK_ANDROID_external_memory_android_hardware_buffer",' \
+        "$source_dir/dlls/winevulkan/vulkan.c"
 fi
 
 if [[ ! -f "$build_dir/Makefile" ]]; then
