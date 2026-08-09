@@ -7,16 +7,31 @@ import com.winlator.container.Container
 import com.winlator.core.WineRegistryEditor
 import com.winlator.core.envvars.EnvVars
 import java.io.File
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import timber.log.Timber
 
 object XrRuntimeManager {
     private const val ENABLED_EXTRA = "xrRuntimeEnabled"
     private const val OPENCOMPOSITE_EXTRA = "xrOpenCompositeEnabled"
     private const val WINDOWS_XR_DIR = "C:\\gamenative\\xr"
+    private const val RUNTIME_JSON_COMMON = "gamenative_openxr.json"
     private const val RUNTIME_JSON_64 = "gamenative_openxr64.json"
     private const val RUNTIME_JSON_32 = "gamenative_openxr32.json"
+    private const val RUNTIME_DLL_COMMON = "C:\\windows\\system32\\gamenative_openxr.dll"
     private const val RUNTIME_DLL_64 = "gamenative_openxr64.dll"
     private const val RUNTIME_DLL_32 = "gamenative_openxr32.dll"
+    private const val UNIX_BRIDGE_MODULE = "gamenative_xr_unixbridge"
+    private const val OPENXR_REGISTRY_KEY_64 = "Software\\Khronos\\OpenXR\\1"
+    // Wine's registry files are case-sensitive to the file editor even though
+    // the Windows registry API is not. Match Wine's canonical key casing so we
+    // replace an existing 32-bit runtime instead of creating a duplicate key.
+    internal const val OPENXR_REGISTRY_KEY_32 =
+        "Software\\Wow6432Node\\Khronos\\OpenXR\\1"
+    private const val OPENXR_REGISTRY_KEY_32_LEGACY =
+        "Software\\WOW6432Node\\Khronos\\OpenXR\\1"
 
     fun isEnabled(context: Context, container: Container): Boolean =
         BuildConfig.XR_BUILD &&
@@ -54,14 +69,20 @@ object XrRuntimeManager {
 
         val runtimeJson64 = File(runtimeDir, RUNTIME_JSON_64)
         val runtimeJson32 = File(runtimeDir, RUNTIME_JSON_32)
+        val runtimeJsonCommon = File(runtimeDir, RUNTIME_JSON_COMMON)
         writeRuntimeManifest(runtimeJson64, RUNTIME_DLL_64)
         writeRuntimeManifest(runtimeJson32, RUNTIME_DLL_32)
+        writeRuntimeManifest(runtimeJsonCommon, RUNTIME_DLL_COMMON)
 
-        writeOpenXrRegistry(container, runtimeJson64, runtimeJson32)
+        writeOpenXrRegistry(container, runtimeJsonCommon, runtimeJsonCommon)
 
         envVars.put("GAMENATIVE_XR", "1")
         // The bridge DLL appends to C:\gamenative\xr\bridge.log when this is set.
         envVars.put("GAMENATIVE_XR_LOG", "1")
+        // Use a concrete app-private path: the Wine/proot /tmp view is not the
+        // ImageFs root that the Android diagnostics process can inspect.
+        val unixLog = File(runtimeDir, "unix.log").apply { delete() }
+        envVars.put("GAMENATIVE_XR_UNIX_LOG", unixLog.absolutePath)
         // The Quest compositor listens in Linux's abstract AF_UNIX namespace.
         // A filesystem /tmp path lives inside the container/proot view and cannot
         // be opened by the Android app process.
@@ -69,11 +90,20 @@ object XrRuntimeManager {
         envVars.put("GAMENATIVE_XR_BRIDGE_HOST", XrBridgeServer.HOST)
         envVars.put("GAMENATIVE_XR_BRIDGE_PORT", XrBridgeServer.PORT.toString())
         envVars.put("GAMENATIVE_XR_RUNTIME_DIR", runtimeDir.absolutePath)
-        // Do not set XR_RUNTIME_JSON here. One environment variable is inherited by
-        // both PE architectures and therefore cannot select the matching runtime DLL.
-        // The Wine OpenXR loader selects the x64/x86 manifest through the corresponding
-        // native/WOW6432 registry view below.
-
+        // This architecture-neutral manifest points into system32. Wine redirects
+        // that path to syswow64 for a 32-bit loader, selecting the matching DLL
+        // without requiring architecture-specific environment variables.
+        envVars.put(
+            "XR_RUNTIME_JSON",
+            "$WINDOWS_XR_DIR\\$RUNTIME_JSON_COMMON",
+        )
+        // The PE companion is a Wine builtin module with an associated Unix
+        // library. If this override is absent, Wine tries to treat the staged
+        // PE file as a regular native DLL and never attaches its unixlib.
+        envVars.put(
+            "WINEDLLOVERRIDES",
+            runtimeDllOverrides(envVars.get("WINEDLLOVERRIDES")),
+        )
         if (isOpenCompositeEnabled(container)) {
             val openCompositeDir = File(container.rootDir, ".wine/drive_c/gamenative/opencomposite")
             if (openCompositeDir.isDirectory) {
@@ -86,15 +116,78 @@ object XrRuntimeManager {
     }
 
     private fun writeRuntimeManifest(target: File, runtimeDll: String) {
-        target.writeText(
-            """
-            {
-              "file_format_version": "1.0.0",
-              "runtime": {
-                "library_path": "$WINDOWS_XR_DIR\\$runtimeDll"
-              }
+        target.writeText(runtimeManifest(runtimeDll))
+    }
+
+    internal fun runtimeManifest(runtimeDll: String): String =
+        buildJsonObject {
+            put("file_format_version", "1.0.0")
+            putJsonObject("runtime") {
+                put("name", "GameNativeVR")
+                put(
+                    "library_path",
+                    if (runtimeDll.length >= 3 &&
+                        runtimeDll[1] == ':' &&
+                        runtimeDll[2] == '\\'
+                    ) {
+                        runtimeDll
+                    } else {
+                        "$WINDOWS_XR_DIR\\$runtimeDll"
+                    },
+                )
             }
-            """.trimIndent(),
+        }.toString()
+
+    internal fun runtimeDllOverrides(existing: String): String {
+        val xrOverride = "$UNIX_BRIDGE_MODULE=b"
+        val withoutTrailingSeparators = existing.trim().trimEnd(';')
+        return if (withoutTrailingSeparators.isEmpty()) {
+            xrOverride
+        } else {
+            "$withoutTrailingSeparators;$xrOverride"
+        }
+    }
+
+    fun diagnosticSummary(container: Container): String {
+        val runtimeDir = File(container.rootDir, ".wine/drive_c/gamenative/xr")
+        val manifest64 = File(runtimeDir, RUNTIME_JSON_64)
+        val manifest32 = File(runtimeDir, RUNTIME_JSON_32)
+        val manifestCommon = File(runtimeDir, RUNTIME_JSON_COMMON)
+        val systemReg = File(container.rootDir, ".wine/system.reg")
+        var registry64: String? = null
+        var registry32: String? = null
+        runCatching {
+            WineRegistryEditor(systemReg).use { registry ->
+                registry64 = registry.getStringValue(
+                    OPENXR_REGISTRY_KEY_64,
+                    "ActiveRuntime",
+                )
+                registry32 = registry.getStringValue(
+                    OPENXR_REGISTRY_KEY_32,
+                    "ActiveRuntime",
+                )
+            }
+        }
+
+        return buildString {
+            appendLine("GameNativeVR OpenXR discovery state:")
+            appendLine("  environmentRuntime=$WINDOWS_XR_DIR\\$RUNTIME_JSON_COMMON")
+            appendLine("  registry64=${registry64 ?: "<missing>"}")
+            appendLine("  registry32=${registry32 ?: "<missing>"}")
+            appendManifestDiagnostic("manifestCommon", manifestCommon)
+            appendManifestDiagnostic("manifest64", manifest64)
+            appendManifestDiagnostic("manifest32", manifest32)
+        }.trimEnd()
+    }
+
+    private fun StringBuilder.appendManifestDiagnostic(label: String, manifest: File) {
+        val contents = runCatching { manifest.readText() }.getOrNull()
+        val valid = contents != null && runCatching {
+            Json.parseToJsonElement(contents)
+        }.isSuccess
+        appendLine(
+            "  $label=${manifest.path} validJson=$valid " +
+                "contents=${contents?.replace("\r", "")?.replace("\n", "") ?: "<unavailable>"}",
         )
     }
 
@@ -109,13 +202,14 @@ object XrRuntimeManager {
         try {
             WineRegistryEditor(systemReg).use { registry ->
                 registry.setCreateKeyIfNotExist(true)
+                registry.removeValue(OPENXR_REGISTRY_KEY_32_LEGACY, "ActiveRuntime")
                 registry.setStringValue(
-                    "Software\\Khronos\\OpenXR\\1",
+                    OPENXR_REGISTRY_KEY_64,
                     "ActiveRuntime",
                     winePath64,
                 )
                 registry.setStringValue(
-                    "Software\\WOW6432Node\\Khronos\\OpenXR\\1",
+                    OPENXR_REGISTRY_KEY_32,
                     "ActiveRuntime",
                     winePath32,
                 )
@@ -129,8 +223,9 @@ object XrRuntimeManager {
         val systemReg = File(container.rootDir, ".wine/system.reg")
         try {
             WineRegistryEditor(systemReg).use { registry ->
-                registry.removeValue("Software\\Khronos\\OpenXR\\1", "ActiveRuntime")
-                registry.removeValue("Software\\WOW6432Node\\Khronos\\OpenXR\\1", "ActiveRuntime")
+                registry.removeValue(OPENXR_REGISTRY_KEY_64, "ActiveRuntime")
+                registry.removeValue(OPENXR_REGISTRY_KEY_32, "ActiveRuntime")
+                registry.removeValue(OPENXR_REGISTRY_KEY_32_LEGACY, "ActiveRuntime")
             }
         } catch (e: Exception) {
             Timber.w(e, "Failed to clear Wine OpenXR runtime registry entries")

@@ -18,9 +18,13 @@
 #include <openxr_platform.h>
 
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -40,6 +44,103 @@
 
 namespace {
 constexpr XrViewConfigurationType kViewType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+constexpr float kHandCubeSizeMeters = 0.15f;
+
+struct Mat4 {
+    float m[16]{};
+};
+
+Mat4 identityMatrix() {
+    Mat4 result{};
+    result.m[0] = result.m[5] = result.m[10] = result.m[15] = 1.0f;
+    return result;
+}
+
+Mat4 multiply(const Mat4& a, const Mat4& b) {
+    Mat4 result{};
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            for (int k = 0; k < 4; ++k) {
+                result.m[column * 4 + row] +=
+                    a.m[k * 4 + row] * b.m[column * 4 + k];
+            }
+        }
+    }
+    return result;
+}
+
+Mat4 rotationMatrix(const XrQuaternionf& q) {
+    const float xx = q.x * q.x;
+    const float yy = q.y * q.y;
+    const float zz = q.z * q.z;
+    const float xy = q.x * q.y;
+    const float xz = q.x * q.z;
+    const float yz = q.y * q.z;
+    const float wx = q.w * q.x;
+    const float wy = q.w * q.y;
+    const float wz = q.w * q.z;
+    Mat4 result = identityMatrix();
+    result.m[0] = 1.0f - 2.0f * (yy + zz);
+    result.m[1] = 2.0f * (xy + wz);
+    result.m[2] = 2.0f * (xz - wy);
+    result.m[4] = 2.0f * (xy - wz);
+    result.m[5] = 1.0f - 2.0f * (xx + zz);
+    result.m[6] = 2.0f * (yz + wx);
+    result.m[8] = 2.0f * (xz + wy);
+    result.m[9] = 2.0f * (yz - wx);
+    result.m[10] = 1.0f - 2.0f * (xx + yy);
+    return result;
+}
+
+Mat4 poseMatrix(const XrPosef& pose) {
+    Mat4 result = rotationMatrix(pose.orientation);
+    result.m[12] = pose.position.x;
+    result.m[13] = pose.position.y;
+    result.m[14] = pose.position.z;
+    return result;
+}
+
+Mat4 inversePoseMatrix(const XrPosef& pose) {
+    XrQuaternionf inverseRotation{
+        -pose.orientation.x,
+        -pose.orientation.y,
+        -pose.orientation.z,
+        pose.orientation.w,
+    };
+    Mat4 rotation = rotationMatrix(inverseRotation);
+    Mat4 translation = identityMatrix();
+    translation.m[12] = -pose.position.x;
+    translation.m[13] = -pose.position.y;
+    translation.m[14] = -pose.position.z;
+    return multiply(rotation, translation);
+}
+
+Mat4 scaleMatrix(float x, float y, float z) {
+    Mat4 result{};
+    result.m[0] = x;
+    result.m[5] = y;
+    result.m[10] = z;
+    result.m[15] = 1.0f;
+    return result;
+}
+
+Mat4 projectionMatrix(const XrFovf& fov, float nearZ = 0.03f, float farZ = 100.0f) {
+    const float left = std::tan(fov.angleLeft);
+    const float right = std::tan(fov.angleRight);
+    const float down = std::tan(fov.angleDown);
+    const float up = std::tan(fov.angleUp);
+    const float width = right - left;
+    const float height = up - down;
+    Mat4 result{};
+    result.m[0] = 2.0f / width;
+    result.m[5] = 2.0f / height;
+    result.m[8] = (right + left) / width;
+    result.m[9] = (up + down) / height;
+    result.m[10] = -(farZ + nearZ) / (farZ - nearZ);
+    result.m[11] = -1.0f;
+    result.m[14] = -(2.0f * farZ * nearZ) / (farZ - nearZ);
+    return result;
+}
 
 bool xrFailed(XrResult result, const char* call) {
     if (XR_FAILED(result)) {
@@ -73,6 +174,8 @@ struct ScreenSwapchain {
 // Windows-side bridge through XrBridgeServer (GET_INPUT).
 struct HandInput {
     bool active{false};
+    bool gripValid{false};
+    bool aimValid{false};
     uint32_t buttons{0};  // bit0 A/X, bit1 B/Y, bit2 stick click, bit3 menu
     float trigger{0.0f};
     float squeeze{0.0f};
@@ -145,6 +248,8 @@ private:
     jmethodID activityFrameStateMethod{nullptr};
     jmethodID activityInputMethod{nullptr};
     jmethodID activityViewConfigMethod{nullptr};
+    jmethodID activityOverlayReadyMethod{nullptr};
+    jmethodID activityDiagnosticMethod{nullptr};
     jfloatArray trackingArrayRef{nullptr};  // 22 eye floats + stage width/height
     jfloatArray inputArrayRef{nullptr};     // global ref, 18 floats (analogs + grip/aim poses)
 
@@ -161,6 +266,7 @@ private:
     std::vector<XrViewConfigurationView> configViews;
     std::vector<XrView> views;
     std::vector<EyeSwapchain> eyeSwapchains;
+    std::vector<EyeSwapchain> overlaySwapchains;
     ScreenSwapchain screenSwapchain;
 
     // Zero-copy eye-buffer transport: the Wine producer ships per-eye AHardwareBuffers
@@ -192,6 +298,12 @@ private:
 
     GLuint blit2DProgram{0};
     GLuint blit2DVbo{0};
+    GLuint overlayProgram{0};
+    GLuint overlayVbo{0};
+    GLuint overlayDepthBuffer{0};
+    GLint overlayMvpUniform{-1};
+    GLint overlayColorUniform{-1};
+    bool overlayReady{false};
     GLuint eyeTextures[gamenative::xr::FrameTransport::kEyeCount]
                       [gamenative::xr::FrameTransport::kMaxImages]{};
     EGLImageKHR eyeImages[gamenative::xr::FrameTransport::kEyeCount]
@@ -200,6 +312,8 @@ private:
                                     [gamenative::xr::FrameTransport::kMaxImages]{};
     uint64_t eyeRenderedSerial[2]{0, 0};
     bool stereoResourcesReady{false};
+    bool stereoProjectionAnnounced{false};
+    bool stereoMilestonePublished{false};
 
     void threadMain() {
         JNIEnv* env = nullptr;
@@ -226,7 +340,7 @@ private:
                 }
             }
             if (sessionRunning) {
-                renderFrame();
+                renderFrame(env);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
             }
@@ -259,6 +373,14 @@ private:
             if (!screenReady) return false;  // no usable presentation path at all
         }
         glGenFramebuffers(1, &framebuffer);
+
+        if (createOverlaySwapchains() && createOverlayResources()) {
+            overlayReady = true;
+            LOGI("XR activity overlay ready: 15 cm hand cubes and left-hand clock");
+            publishOverlayReady(env);
+        } else {
+            LOGW("XR activity overlay unavailable; base XR presentation remains active");
+        }
 
         // Bring up the zero-copy eye-buffer transport. It is harmless when no producer
         // is connected (hasStereoContent() stays false and we render the legacy path).
@@ -315,6 +437,16 @@ private:
             "onNativeXrViewConfig",
             "(II)V");
         if (env->ExceptionCheck()) env->ExceptionClear();
+        activityOverlayReadyMethod = env->GetMethodID(
+            activityClass,
+            "onNativeXrOverlayReady",
+            "()V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        activityDiagnosticMethod = env->GetMethodID(
+            activityClass,
+            "onNativeXrDiagnostic",
+            "(Ljava/lang/String;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(activityClass);
 
         jfloatArray tracking = env->NewFloatArray(24);
@@ -337,6 +469,24 @@ private:
             activityViewConfigMethod,
             static_cast<jint>(configViews[0].recommendedImageRectWidth),
             static_cast<jint>(configViews[0].recommendedImageRectHeight));
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    void publishOverlayReady(JNIEnv* env) {
+        if (env == nullptr || activityOverlayReadyMethod == nullptr) return;
+        env->CallVoidMethod(activityRef, activityOverlayReadyMethod);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    void publishDiagnostic(JNIEnv* env, const char* message) {
+        if (env == nullptr || activityDiagnosticMethod == nullptr || message == nullptr) return;
+        jstring value = env->NewStringUTF(message);
+        if (value == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return;
+        }
+        env->CallVoidMethod(activityRef, activityDiagnosticMethod, value);
+        env->DeleteLocalRef(value);
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
@@ -369,6 +519,13 @@ private:
             LOGE("eglInitialize failed");
             return false;
         }
+        const char* eglExtensions = eglQueryString(eglDisplay, EGL_EXTENSIONS);
+        const bool hasDmaBufImport = eglExtensions != nullptr &&
+            std::strstr(eglExtensions, "EGL_EXT_image_dma_buf_import") != nullptr;
+        const bool hasDmaBufModifiers = eglExtensions != nullptr &&
+            std::strstr(eglExtensions, "EGL_EXT_image_dma_buf_import_modifiers") != nullptr;
+        LOGI("Quest EGL dma-buf import=%d modifiers=%d",
+             hasDmaBufImport ? 1 : 0, hasDmaBufModifiers ? 1 : 0);
 
         const EGLint configAttribs[] = {
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
@@ -625,14 +782,16 @@ private:
         return state.currentState == XR_TRUE;
     }
 
-    void locatePose(XrSpace space, XrTime time, XrPosef* out) {
+    bool locatePose(XrSpace space, XrTime time, XrPosef* out) {
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-        if (XR_FAILED(xrLocateSpace(space, appSpace, time, &location))) return;
+        if (XR_FAILED(xrLocateSpace(space, appSpace, time, &location))) return false;
         constexpr XrSpaceLocationFlags required =
             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
         if ((location.locationFlags & required) == required) {
             *out = location.pose;
+            return true;
         }
+        return false;
     }
 
     void syncInput(XrTime displayTime) {
@@ -659,6 +818,8 @@ private:
             XrActionStatePose poseState{XR_TYPE_ACTION_STATE_POSE};
             input.active = XR_SUCCEEDED(xrGetActionStatePose(session, &getInfo, &poseState)) &&
                 poseState.isActive == XR_TRUE;
+            input.gripValid = false;
+            input.aimValid = false;
 
             input.trigger = getFloatState(triggerAction, handPaths[hand]);
             input.squeeze = getFloatState(squeezeAction, handPaths[hand]);
@@ -682,8 +843,8 @@ private:
             if (hand == 0 && getBoolState(menuAction, handPaths[hand])) input.buttons |= 8u;
 
             if (input.active) {
-                locatePose(gripSpaces[hand], displayTime, &input.grip);
-                locatePose(aimSpaces[hand], displayTime, &input.aim);
+                input.gripValid = locatePose(gripSpaces[hand], displayTime, &input.grip);
+                input.aimValid = locatePose(aimSpaces[hand], displayTime, &input.aim);
             }
             publishInput(hand);
         }
@@ -1023,8 +1184,18 @@ void main() {
             }
         }
         attribs[i++] = EGL_NONE;
-        return eglCreateImageKHR(eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
-                                 static_cast<EGLClientBuffer>(nullptr), attribs);
+        EGLImageKHR image = eglCreateImageKHR(
+            eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+            static_cast<EGLClientBuffer>(nullptr), attribs);
+        if (image == EGL_NO_IMAGE_KHR) {
+            const EGLint error = eglGetError();
+            LOGE("dma-buf EGL import failed error=0x%x size=%dx%d fourcc=0x%08x "
+                 "planes=%d modifier=0x%llx stride0=%u offset0=%u fd0=%d",
+                 error, f.width, f.height, f.fourcc, f.planeCount,
+                 static_cast<unsigned long long>(f.modifier), f.strides[0],
+                 f.offsets[0], f.dmabufFds[0]);
+        }
+        return image;
     }
 
     // Import the latest buffer for `eye` into eyeTextures[eye] as a GL_TEXTURE_2D, dispatching
@@ -1088,7 +1259,7 @@ void main() {
         if (frame.kind == gamenative::xr::BufferKind::None) return false;
         freshFrame = frame.serial != eyeRenderedSerial[eye];
         if (!waitForAcquireFence(frame.acquireFenceFd)) {
-            LOGW("Acquire fence wait failed/timed out for eye %d index %d", eye, frame.imageIndex);
+            LOGE("Acquire fence wait failed/timed out for eye %d index %d", eye, frame.imageIndex);
             frameTransport.discardFrame(
                 eye, frame.imageIndex, frame.serial);
             if (freshFrame) {
@@ -1129,7 +1300,7 @@ void main() {
             image = createImageFromDmabuf(frame);
         }
         if (image == EGL_NO_IMAGE_KHR) {
-            LOGW("eglCreateImageKHR failed for eye %d (kind=%d)", eye, static_cast<int>(frame.kind));
+            LOGE("eglCreateImageKHR failed for eye %d (kind=%d)", eye, static_cast<int>(frame.kind));
             frameTransport.discardFrame(
                 eye, frame.imageIndex, frame.serial);
             if (freshFrame) {
@@ -1140,7 +1311,18 @@ void main() {
 
         if (cachedTexture == 0) glGenTextures(1, &cachedTexture);
         glBindTexture(GL_TEXTURE_2D, cachedTexture);
+        while (glGetError() != GL_NO_ERROR) {}
         glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+        const GLenum importError = glGetError();
+        if (importError != GL_NO_ERROR) {
+            LOGE("glEGLImageTargetTexture2DOES failed eye=%d index=%d error=0x%x",
+                 eye, imageIndex, importError);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            eglDestroyImageKHR(eglDisplay, image);
+            frameTransport.discardFrame(eye, frame.imageIndex, frame.serial);
+            if (freshFrame) eyeRenderedSerial[eye] = frame.serial;
+            return false;
+        }
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1300,10 +1482,9 @@ void main() {
         projectionLayer.views = projectionViews.data();
         submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer);
 
-        static bool announced = false;
-        if (!announced) {
+        if (!stereoProjectionAnnounced) {
             LOGI("Stereo projection ACTIVE: presenting %u eye buffers", projectionLayer.viewCount);
-            announced = true;
+            stereoProjectionAnnounced = true;
         }
         return true;
     }
@@ -1354,6 +1535,391 @@ void main() {
                 reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchain.images.data())));
         }
         return true;
+    }
+
+    bool createOverlaySwapchains() {
+        if (configViews.empty()) return false;
+        uint32_t formatCount = 0;
+        if (XR_FAILED(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr)) ||
+            formatCount == 0) {
+            return false;
+        }
+        std::vector<int64_t> formats(formatCount);
+        if (XR_FAILED(xrEnumerateSwapchainFormats(
+                session, formatCount, &formatCount, formats.data()))) {
+            return false;
+        }
+        int64_t selectedFormat = 0;
+        for (int64_t format : formats) {
+            if (format == GL_RGBA8) {
+                selectedFormat = format;
+                break;
+            }
+        }
+        if (selectedFormat == 0) {
+            LOGW("No RGBA8 OpenXR swapchain format for transparent activity overlay");
+            return false;
+        }
+
+        overlaySwapchains.resize(configViews.size());
+        for (size_t eye = 0; eye < configViews.size(); ++eye) {
+            const auto& cfg = configViews[eye];
+            auto& swapchain = overlaySwapchains[eye];
+            swapchain.width = static_cast<int32_t>(cfg.recommendedImageRectWidth);
+            swapchain.height = static_cast<int32_t>(cfg.recommendedImageRectHeight);
+
+            XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            createInfo.format = selectedFormat;
+            createInfo.sampleCount = 1;
+            createInfo.width = cfg.recommendedImageRectWidth;
+            createInfo.height = cfg.recommendedImageRectHeight;
+            createInfo.faceCount = 1;
+            createInfo.arraySize = 1;
+            createInfo.mipCount = 1;
+            if (xrFailed(
+                    xrCreateSwapchain(session, &createInfo, &swapchain.swapchain),
+                    "xrCreateSwapchain(activity overlay)")) {
+                return false;
+            }
+
+            uint32_t imageCount = 0;
+            if (xrFailed(
+                    xrEnumerateSwapchainImages(
+                        swapchain.swapchain, 0, &imageCount, nullptr),
+                    "xrEnumerateSwapchainImages(activity overlay count)")) {
+                return false;
+            }
+            swapchain.images.assign(
+                imageCount,
+                XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+            if (xrFailed(
+                    xrEnumerateSwapchainImages(
+                        swapchain.swapchain,
+                        imageCount,
+                        &imageCount,
+                        reinterpret_cast<XrSwapchainImageBaseHeader*>(
+                            swapchain.images.data())),
+                    "xrEnumerateSwapchainImages(activity overlay)")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool createOverlayResources() {
+        if (overlaySwapchains.empty()) return false;
+        const char* vertexSource = R"(#version 300 es
+layout(location = 0) in vec3 aPosition;
+uniform mat4 uMvp;
+void main() {
+    gl_Position = uMvp * vec4(aPosition, 1.0);
+})";
+        const char* fragmentSource = R"(#version 300 es
+precision mediump float;
+uniform vec4 uColor;
+out vec4 fragColor;
+void main() {
+    fragColor = vec4(uColor.rgb * uColor.a, uColor.a);
+})";
+        GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSource);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+        if (vs == 0 || fs == 0) {
+            if (vs != 0) glDeleteShader(vs);
+            if (fs != 0) glDeleteShader(fs);
+            return false;
+        }
+        overlayProgram = glCreateProgram();
+        glAttachShader(overlayProgram, vs);
+        glAttachShader(overlayProgram, fs);
+        glLinkProgram(overlayProgram);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(overlayProgram, GL_LINK_STATUS, &linked);
+        if (linked != GL_TRUE) {
+            char log[512] = {};
+            glGetProgramInfoLog(overlayProgram, sizeof(log), nullptr, log);
+            LOGE("Activity overlay program link failed: %s", log);
+            glDeleteProgram(overlayProgram);
+            overlayProgram = 0;
+            return false;
+        }
+        overlayMvpUniform = glGetUniformLocation(overlayProgram, "uMvp");
+        overlayColorUniform = glGetUniformLocation(overlayProgram, "uColor");
+        glGenBuffers(1, &overlayVbo);
+        glGenRenderbuffers(1, &overlayDepthBuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, overlayDepthBuffer);
+        glRenderbufferStorage(
+            GL_RENDERBUFFER,
+            GL_DEPTH_COMPONENT24,
+            overlaySwapchains[0].width,
+            overlaySwapchains[0].height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        return overlayMvpUniform >= 0 && overlayColorUniform >= 0;
+    }
+
+    static void appendQuad(
+        std::vector<float>& vertices,
+        float left,
+        float bottom,
+        float right,
+        float top,
+        float z) {
+        const float quad[] = {
+            left, bottom, z, right, bottom, z, right, top, z,
+            left, bottom, z, right, top, z, left, top, z,
+        };
+        vertices.insert(vertices.end(), quad, quad + 18);
+    }
+
+    static void appendFace(
+        std::vector<float>& vertices,
+        const XrVector3f& a,
+        const XrVector3f& b,
+        const XrVector3f& c,
+        const XrVector3f& d) {
+        const XrVector3f points[] = {a, b, c, a, c, d};
+        for (const XrVector3f& point : points) {
+            vertices.push_back(point.x);
+            vertices.push_back(point.y);
+            vertices.push_back(point.z);
+        }
+    }
+
+    static std::vector<float> cubeVertices() {
+        constexpr float h = 0.5f;
+        std::vector<float> vertices;
+        vertices.reserve(36 * 3);
+        appendFace(vertices, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h});
+        appendFace(vertices, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h});
+        appendFace(vertices, {-h, -h, -h}, {-h, -h, h}, {-h, h, h}, {-h, h, -h});
+        appendFace(vertices, {h, -h, h}, {h, -h, -h}, {h, h, -h}, {h, h, h});
+        appendFace(vertices, {-h, h, h}, {h, h, h}, {h, h, -h}, {-h, h, -h});
+        appendFace(vertices, {-h, -h, -h}, {h, -h, -h}, {h, -h, h}, {-h, -h, h});
+        return vertices;
+    }
+
+    void drawOverlayGeometry(
+        const std::vector<float>& vertices,
+        const Mat4& mvp,
+        float red,
+        float green,
+        float blue,
+        float alpha) {
+        if (vertices.empty()) return;
+        glBindBuffer(GL_ARRAY_BUFFER, overlayVbo);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+            vertices.data(),
+            GL_STREAM_DRAW);
+        glUniformMatrix4fv(overlayMvpUniform, 1, GL_FALSE, mvp.m);
+        glUniform4f(overlayColorUniform, red, green, blue, alpha);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 3));
+        glDisableVertexAttribArray(0);
+    }
+
+    static void appendDigit(
+        std::vector<float>& vertices,
+        int digit,
+        float x,
+        float y,
+        float z) {
+        static constexpr uint8_t masks[10] = {
+            0x3f, 0x06, 0x5b, 0x4f, 0x66,
+            0x6d, 0x7d, 0x07, 0x7f, 0x6f,
+        };
+        constexpr float w = 0.034f;
+        constexpr float h = 0.064f;
+        constexpr float t = 0.006f;
+        const float middle = y + h * 0.5f;
+        const uint8_t mask = masks[digit < 0 || digit > 9 ? 0 : digit];
+        if (mask & 0x01) appendQuad(vertices, x + t, y + h - t, x + w - t, y + h, z);
+        if (mask & 0x02) appendQuad(vertices, x + w - t, middle + t * 0.5f, x + w, y + h - t, z);
+        if (mask & 0x04) appendQuad(vertices, x + w - t, y + t, x + w, middle - t * 0.5f, z);
+        if (mask & 0x08) appendQuad(vertices, x + t, y, x + w - t, y + t, z);
+        if (mask & 0x10) appendQuad(vertices, x, y + t, x + t, middle - t * 0.5f, z);
+        if (mask & 0x20) appendQuad(vertices, x, middle + t * 0.5f, x + t, y + h - t, z);
+        if (mask & 0x40) appendQuad(vertices, x + t, middle - t * 0.5f, x + w - t, middle + t * 0.5f, z);
+    }
+
+    void drawClock(const Mat4& viewProjection, const XrPosef& headPose) {
+        if (!handInputs[0].active || !handInputs[0].gripValid) return;
+
+        XrPosef clockPose{};
+        clockPose.orientation = headPose.orientation;
+        clockPose.position = handInputs[0].grip.position;
+        clockPose.position.y += 0.22f;
+        const Mat4 clockMvp = multiply(viewProjection, poseMatrix(clockPose));
+
+        constexpr float digitW = 0.034f;
+        constexpr float digitH = 0.064f;
+        constexpr float gap = 0.007f;
+        constexpr float colonW = 0.012f;
+        constexpr float totalW = digitW * 4.0f + gap * 4.0f + colonW;
+        const float startX = -totalW * 0.5f;
+        const float startY = -digitH * 0.5f;
+
+        std::vector<float> panel;
+        appendQuad(
+            panel,
+            startX - 0.012f,
+            startY - 0.010f,
+            startX + totalW + 0.012f,
+            startY + digitH + 0.010f,
+            -0.003f);
+        glDisable(GL_CULL_FACE);
+        drawOverlayGeometry(panel, clockMvp, 0.01f, 0.025f, 0.035f, 0.78f);
+
+        std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        const int digits[4] = {
+            local.tm_hour / 10,
+            local.tm_hour % 10,
+            local.tm_min / 10,
+            local.tm_min % 10,
+        };
+        std::vector<float> text;
+        float x = startX;
+        appendDigit(text, digits[0], x, startY, 0.0f);
+        x += digitW + gap;
+        appendDigit(text, digits[1], x, startY, 0.0f);
+        x += digitW + gap;
+        appendQuad(text, x + 0.003f, startY + 0.018f, x + 0.009f, startY + 0.024f, 0.0f);
+        appendQuad(text, x + 0.003f, startY + 0.040f, x + 0.009f, startY + 0.046f, 0.0f);
+        x += colonW + gap;
+        appendDigit(text, digits[2], x, startY, 0.0f);
+        x += digitW + gap;
+        appendDigit(text, digits[3], x, startY, 0.0f);
+        drawOverlayGeometry(text, clockMvp, 0.72f, 0.94f, 1.0f, 0.98f);
+    }
+
+    bool drawActivityOverlayEye(uint32_t eye, GLuint texture) {
+        auto& swapchain = overlaySwapchains[eye];
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        glFramebufferRenderbuffer(
+            GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, overlayDepthBuffer);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            LOGW("Activity overlay framebuffer incomplete for eye %u", eye);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return false;
+        }
+
+        glViewport(0, 0, swapchain.width, swapchain.height);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClearDepthf(1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(overlayProgram);
+
+        const Mat4 viewProjection = multiply(
+            projectionMatrix(views[eye].fov),
+            inversePoseMatrix(views[eye].pose));
+        const std::vector<float> cube = cubeVertices();
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        for (int hand = 0; hand < 2; ++hand) {
+            if (!handInputs[hand].active || !handInputs[hand].gripValid) continue;
+            const Mat4 model = multiply(
+                poseMatrix(handInputs[hand].grip),
+                scaleMatrix(kHandCubeSizeMeters, kHandCubeSizeMeters, kHandCubeSizeMeters));
+            const Mat4 mvp = multiply(viewProjection, model);
+            if (hand == 0) {
+                drawOverlayGeometry(cube, mvp, 0.08f, 0.72f, 1.0f, 0.86f);
+            } else {
+                drawOverlayGeometry(cube, mvp, 1.0f, 0.36f, 0.08f, 0.86f);
+            }
+        }
+        drawClock(viewProjection, views[0].pose);
+
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFlush();
+        return true;
+    }
+
+    bool renderActivityOverlay(
+        const XrFrameState& frameState,
+        std::vector<XrCompositionLayerProjectionView>& overlayViews,
+        XrCompositionLayerProjection& overlayLayer) {
+        if (!overlayReady || overlaySwapchains.empty()) return false;
+        const bool anyHand =
+            (handInputs[0].active && handInputs[0].gripValid) ||
+            (handInputs[1].active && handInputs[1].gripValid);
+        if (!anyHand) return false;
+
+        XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+        locateInfo.viewConfigurationType = kViewType;
+        locateInfo.displayTime = frameState.predictedDisplayTime;
+        locateInfo.space = appSpace;
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        uint32_t viewCount = static_cast<uint32_t>(views.size());
+        const XrResult locateResult = xrLocateViews(
+            session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
+        if (XR_FAILED(locateResult) ||
+            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+            return false;
+        }
+        viewCount = std::min(
+            viewCount, static_cast<uint32_t>(overlaySwapchains.size()));
+        overlayViews.assign(
+            viewCount,
+            XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            auto& swapchain = overlaySwapchains[eye];
+            uint32_t imageIndex = 0;
+            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if (xrFailed(
+                    xrAcquireSwapchainImage(
+                        swapchain.swapchain, &acquireInfo, &imageIndex),
+                    "xrAcquireSwapchainImage(activity overlay)")) {
+                return false;
+            }
+            XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            waitInfo.timeout = XR_INFINITE_DURATION;
+            if (xrFailed(
+                    xrWaitSwapchainImage(swapchain.swapchain, &waitInfo),
+                    "xrWaitSwapchainImage(activity overlay)")) {
+                XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
+                return false;
+            }
+            const bool rendered = drawActivityOverlayEye(
+                eye, swapchain.images[imageIndex].image);
+            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
+            if (!rendered) return false;
+
+            overlayViews[eye].pose = views[eye].pose;
+            overlayViews[eye].fov = views[eye].fov;
+            overlayViews[eye].subImage.swapchain = swapchain.swapchain;
+            overlayViews[eye].subImage.imageRect.offset = {0, 0};
+            overlayViews[eye].subImage.imageRect.extent = {
+                swapchain.width, swapchain.height};
+        }
+
+        overlayLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        overlayLayer.space = appSpace;
+        overlayLayer.viewCount = static_cast<uint32_t>(overlayViews.size());
+        overlayLayer.views = overlayViews.data();
+        return !overlayViews.empty();
     }
 
     void notifySurfaceDestroyed(JNIEnv* env) {
@@ -1420,7 +1986,7 @@ void main() {
         }
     }
 
-    void renderFrame() {
+    void renderFrame(JNIEnv* env) {
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         if (xrFailed(xrWaitFrame(session, &waitInfo, &frameState), "xrWaitFrame")) return;
@@ -1432,13 +1998,23 @@ void main() {
         std::vector<XrCompositionLayerProjectionView> projectionViews;
         XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* submittedLayer = nullptr;
+        std::vector<XrCompositionLayerProjectionView> overlayViews;
+        XrCompositionLayerProjection overlayLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        std::vector<const XrCompositionLayerBaseHeader*> submittedLayers;
 
         publishFrameState(frameState);
         syncInput(frameState.predictedDisplayTime);
 
-        if (frameState.shouldRender &&
-            renderStereoProjection(frameState, projectionViews, projectionLayer, submittedLayer)) {
+        const bool stereoRendered = frameState.shouldRender &&
+            renderStereoProjection(frameState, projectionViews, projectionLayer, submittedLayer);
+        if (stereoRendered) {
             // True per-eye stereo from the game's AHardwareBuffers; submittedLayer is set.
+            if (stereoProjectionAnnounced) {
+                if (!stereoMilestonePublished) {
+                    publishDiagnostic(env, "Stereo projection active: game images displayed");
+                    stereoMilestonePublished = true;
+                }
+            }
         } else if (frameState.shouldRender && screenSwapchain.swapchain != XR_NULL_HANDLE) {
             renderScreenTexture();
             quadLayer.space = appSpace;
@@ -1480,11 +2056,18 @@ void main() {
             }
         }
 
+        if (submittedLayer != nullptr) submittedLayers.push_back(submittedLayer);
+        if (frameState.shouldRender &&
+            renderActivityOverlay(frameState, overlayViews, overlayLayer)) {
+            submittedLayers.push_back(
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&overlayLayer));
+        }
+
         XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
         endInfo.environmentBlendMode = blendMode;
-        endInfo.layerCount = submittedLayer ? 1 : 0;
-        endInfo.layers = submittedLayer ? &submittedLayer : nullptr;
+        endInfo.layerCount = static_cast<uint32_t>(submittedLayers.size());
+        endInfo.layers = submittedLayers.empty() ? nullptr : submittedLayers.data();
         xrEndFrame(session, &endInfo);
     }
 
@@ -1681,6 +2264,14 @@ void main() {
                 swapchain.swapchain = XR_NULL_HANDLE;
             }
         }
+        for (auto& swapchain : overlaySwapchains) {
+            if (swapchain.swapchain != XR_NULL_HANDLE) {
+                xrDestroySwapchain(swapchain.swapchain);
+                swapchain.swapchain = XR_NULL_HANDLE;
+            }
+        }
+        overlaySwapchains.clear();
+        overlayReady = false;
         for (int hand = 0; hand < 2; ++hand) {
             if (gripSpaces[hand] != XR_NULL_HANDLE) {
                 xrDestroySpace(gripSpaces[hand]);
@@ -1755,6 +2346,18 @@ void main() {
         if (blit2DProgram != 0) {
             glDeleteProgram(blit2DProgram);
             blit2DProgram = 0;
+        }
+        if (overlayDepthBuffer != 0) {
+            glDeleteRenderbuffers(1, &overlayDepthBuffer);
+            overlayDepthBuffer = 0;
+        }
+        if (overlayVbo != 0) {
+            glDeleteBuffers(1, &overlayVbo);
+            overlayVbo = 0;
+        }
+        if (overlayProgram != 0) {
+            glDeleteProgram(overlayProgram);
+            overlayProgram = 0;
         }
         if (eglDisplay != EGL_NO_DISPLAY) {
             eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

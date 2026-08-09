@@ -50,6 +50,8 @@ class XrBridgeServer {
     @Volatile var onHaptic: ((hand: Int, amplitude: Float, durationNs: Long, frequency: Float) -> Unit)? = null
     /** Invoked when the Windows application calls xrRequestExitSession. */
     @Volatile var onRequestExit: (() -> Unit)? = null
+    /** Low-volume milestones used by the persistent Quest launch diagnostics. */
+    @Volatile var onDiagnosticEvent: ((String) -> Unit)? = null
 
     // Diagnostics (see docs/xr: adb logcat -s XrBridgeServer, or the STATUS command).
     @Volatile private var clientConnected = false
@@ -126,6 +128,7 @@ class XrBridgeServer {
             clientConnected = true
             publishStatus()
             Timber.i("GameNativeVR bridge client connected from ${client.remoteSocketAddress}")
+            onDiagnosticEvent?.invoke("OpenXR bridge connected")
             while (running.get()) {
                 val line = reader.readLine() ?: break
                 val response = handleCommand(line.trim())
@@ -136,6 +139,7 @@ class XrBridgeServer {
             clientConnected = false
             publishStatus()
             Timber.i("GameNativeVR bridge client disconnected (lastCommand=$lastCommand)")
+            onDiagnosticEvent?.invoke("OpenXR bridge disconnected (lastCommand=${lastCommand.ifEmpty { "none" }})")
         }
     }
 
@@ -155,6 +159,7 @@ class XrBridgeServer {
                     "width=${micro(stageWidth)} height=${micro(stageHeight)}"
             command == "BEGIN_SESSION" -> {
                 Timber.i("GameNativeVR game began session")
+                onDiagnosticEvent?.invoke("OpenXR session began")
                 "OK"
             }
             command == "END_SESSION" -> {
@@ -172,7 +177,9 @@ class XrBridgeServer {
             command == "BEGIN_FRAME" -> "OK"
             command.startsWith("END_FRAME") -> {
                 if ((parseLong(command, "layers") ?: 0L) > 0L) {
-                    submittedFrames.incrementAndGet()
+                    if (submittedFrames.incrementAndGet() == 1L) {
+                        onDiagnosticEvent?.invoke("First OpenXR frame submitted")
+                    }
                 }
                 "OK"
             }
@@ -182,12 +189,14 @@ class XrBridgeServer {
             command.startsWith("GFX_API") -> {
                 gfxApi = command.removePrefix("GFX_API ").trim()
                 Timber.i("GameNativeVR game graphics binding -> %s", gfxApi)
+                onDiagnosticEvent?.invoke("OpenXR graphics binding: $gfxApi")
                 "OK"
             }
             command.startsWith("SWAPCHAIN_CREATE") -> {
                 swapchainRequests++
                 activeSwapchains.incrementAndGet()
                 Timber.i("GameNativeVR producer created swapchain: %s", command)
+                onDiagnosticEvent?.invoke("OpenXR swapchain created")
                 "OK"
             }
             command == "SWAPCHAIN_DESTROY" -> {

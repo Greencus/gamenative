@@ -26,7 +26,7 @@ import `in`.dragonbra.javasteam.types.KeyValue
 import java.util.Date
 import timber.log.Timber
 
-const val CURRENT_UFS_PARSE_VERSION = 4
+const val CURRENT_UFS_PARSE_VERSION = 5
 
 /**
  * Extension functions relating to [KeyValue] as the receiver type.
@@ -145,6 +145,7 @@ fun KeyValue.generateSteamApp(): SteamApp {
                     type = it["type"].value.orEmpty(),
                     configOS = OS.from(it["config"]["oslist"].value),
                     configArch = OSArch.from(it["config"]["osarch"].value),
+                    arguments = it["arguments"].value.orEmpty(),
                 )
             },
             steamControllerTemplateIndex = this["config"]["steamcontrollertemplateindex"].asInteger(),

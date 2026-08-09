@@ -60,6 +60,7 @@ static VkDevice device;
 static VkQueue queue;
 static void *vulkan_so;
 static int transport_fd = -1;
+static uint8_t transport_frame_announced[2];
 
 static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
 static PFN_vkGetPhysicalDeviceMemoryProperties p_vkGetPhysicalDeviceMemoryProperties;
@@ -81,7 +82,9 @@ static PFN_vkQueueWaitIdle p_vkQueueWaitIdle;
 
 static void log_line(const char *line)
 {
-    FILE *f = fopen("/tmp/gamenative-xr-unix.log", "a");
+    const char *path = getenv("GAMENATIVE_XR_UNIX_LOG");
+    if (!path || !*path) path = "/tmp/gamenative-xr-unix.log";
+    FILE *f = fopen(path, "a");
     if (!f) return;
     fprintf(f, "%s\n", line);
     fclose(f);
@@ -100,8 +103,22 @@ static void log_vulkan_context_state(void)
     log_line(line);
 }
 
+static uintptr_t mapping_lookup_address(uintptr_t address)
+{
+#if UINTPTR_MAX > 0xffffffffu
+    /* Android's heap pointer tagging uses the ignored ARM64 top byte (TBI).
+     * /proc/self/maps contains canonical, untagged virtual addresses. Keep the
+     * original tagged pointer for dereferencing and Vulkan calls, but remove
+     * the tag while checking whether its backing mapping is readable. */
+    return address & (uintptr_t)0x00ffffffffffffffULL;
+#else
+    return address;
+#endif
+}
+
 static uintptr_t readable_mapping_end(uintptr_t address)
 {
+    address = mapping_lookup_address(address);
     FILE *maps = fopen("/proc/self/maps", "r");
     char line[256];
     if (!maps) return address;
@@ -119,12 +136,29 @@ static uintptr_t readable_mapping_end(uintptr_t address)
     return address;
 }
 
+static int readable_mapping_contains(uintptr_t address, size_t size)
+{
+    uintptr_t lookup_address;
+    uintptr_t end;
+    if (!address || !size) return 0;
+    lookup_address = mapping_lookup_address(address);
+    end = readable_mapping_end(lookup_address);
+    return end > lookup_address && size <= end - lookup_address;
+}
+
 static uint64_t unwrap_dispatchable(uint64_t client_handle)
 {
     char trace[224];
     const struct wine_client_object *client =
         (const struct wine_client_object *)(uintptr_t)client_handle;
-    if (!client || !client->unix_handle) {
+    if (!readable_mapping_contains((uintptr_t)client, sizeof(*client))) {
+        snprintf(trace, sizeof(trace),
+                 "unwrap client=0x%llx is not a readable Wine object",
+                 (unsigned long long)client_handle);
+        log_line(trace);
+        return 0;
+    }
+    if (!client->unix_handle) {
         snprintf(trace, sizeof(trace), "unwrap client=0x%llx has no unix object",
                  (unsigned long long)client_handle);
         log_line(trace);
@@ -132,9 +166,17 @@ static uint64_t unwrap_dispatchable(uint64_t client_handle)
     }
     const uint64_t *object =
         (const uint64_t *)(uintptr_t)client->unix_handle;
-    if (object[1] == client->unix_handle) {
+    if (!readable_mapping_contains((uintptr_t)object, 2 * sizeof(*object))) {
         snprintf(trace, sizeof(trace),
-                 "unwrap client=0x%llx object=0x%llx Wine10 host=0x%llx",
+                 "unwrap client=0x%llx unix object=0x%llx is not readable",
+                 (unsigned long long)client_handle,
+                 (unsigned long long)client->unix_handle);
+        log_line(trace);
+        return 0;
+    }
+    if (object[1] == client_handle) {
+        snprintf(trace, sizeof(trace),
+                 "unwrap client=0x%llx object=0x%llx Wine10+ host=0x%llx",
                  (unsigned long long)client_handle,
                  (unsigned long long)client->unix_handle,
                  (unsigned long long)object[0]);
@@ -150,9 +192,10 @@ static uint64_t unwrap_dispatchable(uint64_t client_handle)
      * heap mapping so the same unixlib works with GameNative's Wine 9.2 and
      * newer user-installed Wine builds.
      */
-    uintptr_t end = readable_mapping_end((uintptr_t)object);
-    size_t words = end > (uintptr_t)object ?
-        (end - (uintptr_t)object) / sizeof(*object) : 0;
+    uintptr_t object_address = mapping_lookup_address((uintptr_t)object);
+    uintptr_t end = readable_mapping_end(object_address);
+    size_t words = end > object_address ?
+        (end - object_address) / sizeof(*object) : 0;
     if (words > 8192) words = 8192;
     for (size_t i = 0; i + 1 < words; ++i) {
         if (object[i] == client_handle) {
@@ -457,11 +500,17 @@ static int create_image(struct gn_swapchain *swapchain, struct gn_image *out,
                     (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
                     modifiers[i].drmFormatModifierPlaneCount >= 1 &&
                     modifiers[i].drmFormatModifierPlaneCount <= 4) {
-                    chosen_modifier = modifiers[i].drmFormatModifier;
-                    chosen_plane_count =
-                        modifiers[i].drmFormatModifierPlaneCount;
-                    has_chosen_modifier = 1;
-                    break;
+                    /* Prefer LINEAR (modifier 0) whenever Turnip exposes it.  The
+                     * consumer is Android's proprietary EGL driver, so an arbitrary
+                     * first vendor modifier is not necessarily importable there even
+                     * though it is valid for the producing Vulkan device. */
+                    if (!has_chosen_modifier || modifiers[i].drmFormatModifier == 0) {
+                        chosen_modifier = modifiers[i].drmFormatModifier;
+                        chosen_plane_count =
+                            modifiers[i].drmFormatModifierPlaneCount;
+                        has_chosen_modifier = 1;
+                    }
+                    if (modifiers[i].drmFormatModifier == 0) break;
                 }
             }
         }
@@ -561,6 +610,18 @@ static int create_image(struct gn_swapchain *swapchain, struct gn_image *out,
         if (p_vkGetImageDrmFormatModifierPropertiesEXT(device, out->image, &props) == VK_SUCCESS)
             out->modifier = props.drmFormatModifier;
     }
+    {
+        char trace[320];
+        snprintf(trace, sizeof(trace),
+                 "dma-buf image format=%d size=%ux%u layers=%u tiling=%s "
+                 "modifier=0x%llx planes=%u stride0=%u offset0=%u",
+                 (int)swapchain->format, swapchain->width, swapchain->height,
+                 array_size ? array_size : 1,
+                 has_chosen_modifier ? "modifier" : "linear",
+                 (unsigned long long)out->modifier, out->plane_count,
+                 out->strides[0], out->offsets[0]);
+        log_line(trace);
+    }
     return 1;
 
 fail:
@@ -606,7 +667,7 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
             device, image->image, &subresource, &layouts[plane]);
     }
 
-    char line[512], response[64];
+    char line[512], response[64] = {0};
     const uint32_t fourcc = format_to_fourcc(swapchain->format);
     if (!fourcc) return 0;
     const uint32_t transport_index = slot * GN_UNIX_MAX_IMAGES + image_index;
@@ -631,6 +692,11 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     int sent_planes = 1;
     if (!transact_line(line, response, sizeof(response)) ||
         strncmp(response, "OK", 2)) {
+        char trace[192];
+        snprintf(trace, sizeof(trace),
+                 "dma-buf registration rejected eye=%u index=%u response=%s",
+                 eye, transport_index, response[0] ? response : "<none>");
+        log_line(trace);
         sent_planes = 0;
     }
     for (uint32_t plane = 0;
@@ -644,6 +710,17 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     }
     image->registered_eye_mask |= bit;
     image->registered_array_index[eye] = array_index;
+    {
+        char trace[320];
+        snprintf(trace, sizeof(trace),
+                 "dma-buf registered eye=%u index=%u array=%u size=%ux%u "
+                 "fourcc=0x%08x modifier=0x%llx planes=%u stride0=%u offset0=%u",
+                 eye, transport_index, array_index, swapchain->width,
+                 swapchain->height, fourcc,
+                 (unsigned long long)image->modifier, image->plane_count,
+                 (uint32_t)layouts[0].rowPitch, (uint32_t)layouts[0].offset);
+        log_line(trace);
+    }
     return 1;
 }
 
@@ -695,7 +772,16 @@ static int32_t unix_init(void *opaque)
 static int32_t unix_set_vulkan_context(void *opaque)
 {
     struct gn_unix_vulkan_context_args *args = opaque;
+    char trace[256];
     pthread_mutex_lock(&state_mutex);
+    args->diagnostic_flags = 0;
+    snprintf(trace, sizeof(trace),
+             "Vulkan context request source=%s phys=0x%llx device=0x%llx queue=0x%llx",
+             args->handles_are_host ? "host" : "wine-client",
+             (unsigned long long)args->client_physical_device,
+             (unsigned long long)args->client_device,
+             (unsigned long long)args->client_queue);
+    log_line(trace);
     if (args->handles_are_host) {
         physical_device = (VkPhysicalDevice)(uintptr_t)args->client_physical_device;
         device = (VkDevice)(uintptr_t)args->client_device;
@@ -705,7 +791,32 @@ static int32_t unix_set_vulkan_context(void *opaque)
         device = (VkDevice)(uintptr_t)unwrap_dispatchable(args->client_device);
         queue = (VkQueue)(uintptr_t)unwrap_dispatchable(args->client_queue);
     }
+    if (readable_mapping_contains((uintptr_t)physical_device, sizeof(void *)))
+        args->diagnostic_flags |= GN_UNIX_VK_DIAG_PHYSICAL_DEVICE;
+    if (readable_mapping_contains((uintptr_t)device, sizeof(void *)))
+        args->diagnostic_flags |= GN_UNIX_VK_DIAG_DEVICE;
+    if (readable_mapping_contains((uintptr_t)queue, sizeof(void *)))
+        args->diagnostic_flags |= GN_UNIX_VK_DIAG_QUEUE;
+    if ((args->diagnostic_flags &
+         (GN_UNIX_VK_DIAG_PHYSICAL_DEVICE | GN_UNIX_VK_DIAG_DEVICE |
+          GN_UNIX_VK_DIAG_QUEUE)) !=
+        (GN_UNIX_VK_DIAG_PHYSICAL_DEVICE | GN_UNIX_VK_DIAG_DEVICE |
+         GN_UNIX_VK_DIAG_QUEUE)) {
+        log_line("Vulkan context rejected: resolved host handles are not readable");
+        physical_device = VK_NULL_HANDLE;
+        device = VK_NULL_HANDLE;
+        queue = VK_NULL_HANDLE;
+        args->result = GN_UNIX_ERROR_UNAVAILABLE;
+        pthread_mutex_unlock(&state_mutex);
+        return 0;
+    }
     load_vulkan_functions();
+    if (vulkan_so) args->diagnostic_flags |= GN_UNIX_VK_DIAG_VULKAN_LIBRARY;
+    if (p_vkGetDeviceProcAddr)
+        args->diagnostic_flags |= GN_UNIX_VK_DIAG_GET_DEVICE_PROC_ADDR;
+    if (p_vkCreateImage) args->diagnostic_flags |= GN_UNIX_VK_DIAG_CREATE_IMAGE;
+    if (p_vkGetMemoryFdKHR)
+        args->diagnostic_flags |= GN_UNIX_VK_DIAG_GET_MEMORY_FD;
     log_vulkan_context_state();
     args->result = physical_device && device && queue && p_vkCreateImage &&
                    p_vkGetMemoryFdKHR ? GN_UNIX_SUCCESS : GN_UNIX_ERROR_UNAVAILABLE;
@@ -781,7 +892,7 @@ static int32_t unix_acquire_image(void *opaque)
         return 0;
     }
     pthread_mutex_lock(&socket_mutex);
-    char line[512], response[64];
+    char line[512], response[64] = {0};
     snprintf(line, sizeof(line), "ACQUIRE eye=0 index=%u\n", args->image_index);
     /* A swapchain image can be submitted to either eye. Ask every eye on which it
        was registered; each consumer slot has an independent release fence. */
@@ -853,7 +964,7 @@ static int32_t unix_submit_image(void *opaque)
         return 0;
     }
     int fence_fd = make_acquire_fence_fd();
-    char line[512], response[64];
+    char line[512], response[64] = {0};
     const uint32_t transport_index =
         args->slot * GN_UNIX_MAX_IMAGES + args->image_index;
     snprintf(line, sizeof(line),
@@ -885,7 +996,21 @@ static int32_t unix_submit_image(void *opaque)
         ok = transact_line(line, response, sizeof(response)) &&
              !strncmp(response, "OK", 2);
     }
-    if (!ok) close_transport();
+    if (!ok) {
+        char trace[192];
+        snprintf(trace, sizeof(trace),
+                 "frame transport failed eye=%u index=%u response=%s",
+                 args->eye, transport_index, response[0] ? response : "<none>");
+        log_line(trace);
+        close_transport();
+    } else if (!transport_frame_announced[args->eye]) {
+        char trace[160];
+        snprintf(trace, sizeof(trace),
+                 "first transported frame eye=%u index=%u fence=%u",
+                 args->eye, transport_index, fence_fd >= 0 ? 1u : 0u);
+        log_line(trace);
+        transport_frame_announced[args->eye] = 1;
+    }
     swapchains[args->slot].images[args->image_index].submitted = ok ? 1 : 0;
     args->result = ok ? GN_UNIX_SUCCESS : GN_UNIX_ERROR_TRANSPORT;
     pthread_mutex_unlock(&socket_mutex);

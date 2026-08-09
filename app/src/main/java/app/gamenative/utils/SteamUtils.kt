@@ -450,10 +450,25 @@ object SteamUtils {
         val sanitizedExecutablePath = sanitizeColdClientArgumentText(executablePath)
         val sanitizedExeCommandLine = sanitizeColdClientArgumentText(exeCommandLine)
         val sanitizedExeRunDirOverride = exeRunDirOverride?.let(::sanitizeColdClientArgumentText)
-        val exeBaseDir = sanitizedExeRunDirOverride ?: "steamapps\\common\\$gameName"
-        val exePath = "$exeBaseDir\\${sanitizedExecutablePath.replace("/", "\\")}"
-        val exeRunDir = sanitizedExeRunDirOverride
-            ?: if (workingDir.isNullOrEmpty()) exePath.substringBeforeLast("\\") else ""
+        val gameDrive = "A:"
+        val normalizedExecutable = normalizeSteamPath(sanitizedExecutablePath, listOf(gameName))
+        val exePath = if (sanitizedExeRunDirOverride != null) {
+            "$sanitizedExeRunDirOverride\\${sanitizedExecutablePath.replace("/", "\\")}"
+        } else {
+            "$gameDrive\\${normalizedExecutable.replace('/', '\\')}"
+        }
+        val normalizedWorkingDir = workingDir
+            ?.takeIf { it.isNotBlank() }
+            ?.let { normalizeSteamPath(it, listOf(gameName)) }
+        val executableDirectory = exePath
+            .substringBeforeLast("\\", "$gameDrive\\")
+            .let { directory -> if (directory.endsWith(':')) "$directory\\" else directory }
+        val exeRunDir = when {
+            sanitizedExeRunDirOverride != null -> sanitizedExeRunDirOverride
+            workingDir.isNullOrBlank() -> executableDirectory
+            normalizedWorkingDir.isNullOrBlank() -> "$gameDrive\\"
+            else -> "$gameDrive\\${normalizedWorkingDir.replace('/', '\\')}"
+        }
 
         // Only include DllsToInjectFolder if unpackFiles is enabled
         val injectionSection = if (isUnpackFiles) {
@@ -526,9 +541,10 @@ object SteamUtils {
         gameName: String,
         vararg candidates: String,
     ): String {
+        val installFolderNames = listOf(gameName, appDir.name).filter { it.isNotBlank() }.distinct()
         val normalizedCandidates = candidates
             .asSequence()
-            .map { normalizeSteamExecutablePath(it, gameName) }
+            .map { normalizeSteamPath(it, installFolderNames) }
             .filter { it.isNotBlank() }
             .distinct()
             .toList()
@@ -545,18 +561,28 @@ object SteamUtils {
         return ""
     }
 
-    private fun normalizeSteamExecutablePath(executablePath: String, gameName: String): String {
-        var normalized = executablePath
+    private fun normalizeSteamPath(path: String, installFolderNames: List<String>): String {
+        var normalized = path
             .trim()
             .trim('"')
             .replace('\\', '/')
             .trimStart('/')
 
+        val installDirPrefix = listOf(
+            "%INSTALLDIR%",
+            "\${INSTALLDIR}",
+            "\$INSTALLDIR",
+        ).firstOrNull { normalized.startsWith(it, ignoreCase = true) }
+        if (installDirPrefix != null) {
+            normalized = normalized
+                .substring(installDirPrefix.length)
+                .trimStart('/')
+        }
         while (normalized.startsWith("./")) {
             normalized = normalized.removePrefix("./")
         }
 
-        if (normalized.isBlank()) return ""
+        if (normalized.isBlank() || normalized == ".") return ""
 
         val lower = normalized.lowercase(Locale.ROOT)
         val commonMarker = "/steamapps/common/"
@@ -565,23 +591,42 @@ object SteamUtils {
             normalized = normalized.substring(commonIndex + commonMarker.length)
         }
 
-        val gamePrefix = gameName.replace('\\', '/').trim('/')
-        if (gamePrefix.isNotBlank()) {
-            if (normalized.equals(gamePrefix, ignoreCase = true)) {
-                return ""
-            }
-            val prefixedGamePath = "$gamePrefix/"
-            if (normalized.startsWith(prefixedGamePath, ignoreCase = true)) {
-                normalized = normalized.substring(prefixedGamePath.length)
+        if (normalized.length >= 3 && normalized[1] == ':' && normalized[2] == '/') {
+            normalized = normalized.substring(3)
+        }
+
+        installFolderNames.forEach { folderName ->
+            val gamePrefix = folderName.replace('\\', '/').trim('/')
+            if (gamePrefix.isNotBlank()) {
+                if (normalized.equals(gamePrefix, ignoreCase = true)) {
+                    return ""
+                }
+                val prefixedGamePath = "$gamePrefix/"
+                if (normalized.startsWith(prefixedGamePath, ignoreCase = true)) {
+                    normalized = normalized.substring(prefixedGamePath.length)
+                    return@forEach
+                }
             }
         }
 
-        return normalized.trimStart('/')
+        val segments = mutableListOf<String>()
+        normalized.split('/').forEach { segment ->
+            when (segment) {
+                "", "." -> Unit
+                ".." -> {
+                    if (segments.isEmpty()) return ""
+                    segments.removeAt(segments.lastIndex)
+                }
+                else -> segments.add(segment)
+            }
+        }
+        return segments.joinToString("/")
     }
 
     internal fun writeColdClientIni(
         steamAppId: Int,
         container: Container,
+        executablePath: String,
         launchInfo: LaunchInfo? = null,
         exeCommandLineOverride: String? = null,
     ) {
@@ -592,7 +637,7 @@ object SteamUtils {
             ?: File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam")
         val launchConfig = resolveColdClientLaunchConfig(
             steamAppId = steamAppId,
-            executablePath = container.executablePath,
+            executablePath = executablePath,
             exeCommandLine = exeCommandLineOverride ?: container.execArgs,
             gameRootDir = File(SteamService.getAppDirPath(steamAppId)),
         )

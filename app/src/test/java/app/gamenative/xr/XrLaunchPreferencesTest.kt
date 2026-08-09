@@ -24,17 +24,97 @@ class XrLaunchPreferencesTest {
     }
 
     @Test
+    fun `recognizes games with a Windows VR launch option`() {
+        val launchInfos = listOf(
+            info("Play on desktop", "game.exe"),
+            info("Play in SteamVR", "game_vr.exe"),
+        )
+
+        assertTrue(XrLaunchPreferences.hasWindowsVrLaunchOption(launchInfos))
+    }
+
+    @Test
+    fun `does not classify flat or non-Windows launch options as Windows VR games`() {
+        assertFalse(
+            XrLaunchPreferences.hasWindowsVrLaunchOption(
+                listOf(
+                    info("Non-VR desktop mode", "game.exe"),
+                    info("OpenXR", "game.sh"),
+                ),
+            ),
+        )
+        assertFalse(XrLaunchPreferences.hasWindowsVrLaunchOption(emptyList()))
+    }
+
+    @Test
     fun `display name includes the selected executable`() {
         val launchInfo = info("OpenXR", "bin\\win64\\game.exe")
         assertEquals("OpenXR - game.exe", XrLaunchPreferences.displayName(launchInfo, 1))
     }
 
-    private fun info(description: String, executable: String) = LaunchInfo(
+    @Test
+    fun `Steam launch arguments are preserved without command placeholders`() {
+        assertEquals(
+            "-vr -openxr",
+            XrLaunchPreferences.steamLaunchArguments(
+                info("OpenXR", "game.exe", "  %command% -vr -openxr  "),
+            ),
+        )
+    }
+
+    @Test
+    fun `VR launch removes desktop fpfc flags for every game`() {
+        assertEquals(
+            "--verbose \"two words\"",
+            XrLaunchPreferences.sanitizeVrLaunchArguments("-fpfc --verbose \"two words\""),
+        )
+        assertEquals(
+            "",
+            XrLaunchPreferences.sanitizeVrLaunchArguments("FPFC"),
+        )
+    }
+
+    @Test
+    fun `VR launch removes common no-VR flags case-insensitively`() {
+        assertEquals(
+            "--verbose",
+            XrLaunchPreferences.sanitizeVrLaunchArguments("--No-VR --verbose /NOHMD"),
+        )
+    }
+
+    @Test
+    fun `VR launch removes paired and inline disabled mode options`() {
+        assertEquals(
+            "--quality high",
+            XrLaunchPreferences.sanitizeVrLaunchArguments(
+                "-vrmode none --xr-mode=off --quality high",
+            ),
+        )
+        assertEquals(
+            "",
+            XrLaunchPreferences.sanitizeVrLaunchArguments(
+                "/vrmode:desktop --xrmode disabled",
+            ),
+        )
+    }
+
+    @Test
+    fun `VR launch preserves enabling modes and unrelated quoted arguments`() {
+        assertEquals(
+            "-vrmode openxr --name \"flat world\" --count 0",
+            XrLaunchPreferences.sanitizeVrLaunchArguments(
+                "-vrmode openxr --name \"flat world\" --count 0",
+            ),
+        )
+    }
+
+    private fun info(description: String, executable: String, arguments: String = "") = LaunchInfo(
         executable = executable,
         workingDir = "",
         description = description,
         type = "",
         configOS = EnumSet.of(OS.windows),
         configArch = OSArch.Unknown,
+        arguments = arguments,
     )
 }
