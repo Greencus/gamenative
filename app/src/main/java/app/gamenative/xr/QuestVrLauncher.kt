@@ -22,6 +22,7 @@ object QuestVrLauncher {
     const val EXTRA_LAUNCH_TYPE = "app.gamenative.xr.LAUNCH_TYPE"
     const val EXTRA_LAUNCH_ARGUMENTS = "app.gamenative.xr.LAUNCH_ARGUMENTS"
     const val EXTRA_RENDER_SCALE = "app.gamenative.xr.RENDER_SCALE"
+    const val EXTRA_FRAME_PACING_DIVISOR = "app.gamenative.xr.FRAME_PACING_DIVISOR"
     const val EXTRA_OPENCOMPOSITE = "app.gamenative.xr.OPENCOMPOSITE"
     const val EXTRA_THEATER_SCREEN = "app.gamenative.xr.THEATER_SCREEN"
     const val EXTRA_CLOCK = "app.gamenative.xr.CLOCK"
@@ -60,6 +61,7 @@ object QuestVrLauncher {
             // Carry the exact durable snapshot into the XR activity. This avoids a second,
             // potentially racing container read during the activity hand-off.
             putExtra(EXTRA_RENDER_SCALE, xrSettings.renderScale)
+            putExtra(EXTRA_FRAME_PACING_DIVISOR, xrSettings.framePacingDivisor)
             putExtra(EXTRA_OPENCOMPOSITE, xrSettings.openCompositeEnabled)
             putExtra(EXTRA_THEATER_SCREEN, xrSettings.theaterScreenEnabled)
             putExtra(EXTRA_CLOCK, xrSettings.clockEnabled)

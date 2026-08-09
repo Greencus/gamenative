@@ -110,6 +110,8 @@ data class ContainerData(
     val bionicFgEnabled: Boolean = false,
     /** OpenXR render size as a percentage of the headset-recommended per-eye size. */
     val xrRenderScale: Int = 100,
+    /** Number of headset refreshes between game frames (1 = native, 2 = half-rate). */
+    val xrFramePacingDivisor: Int = 1,
     /** Use OpenComposite for games that expose OpenVR rather than OpenXR. */
     val xrOpenCompositeEnabled: Boolean = true,
     /** Show the container desktop as a floating screen until stereo frames arrive. */
@@ -189,6 +191,7 @@ data class ContainerData(
                     "lsfgEnabled" to state.lsfgEnabled,
                     "bionicFgEnabled" to state.bionicFgEnabled,
                     "xrRenderScale" to state.xrRenderScale,
+                    "xrFramePacingDivisor" to state.xrFramePacingDivisor,
                     "xrOpenCompositeEnabled" to state.xrOpenCompositeEnabled,
                     "xrTheaterScreenEnabled" to state.xrTheaterScreenEnabled,
                     "xrClockEnabled" to state.xrClockEnabled,
@@ -264,6 +267,7 @@ data class ContainerData(
                     lsfgEnabled = (savedMap["lsfgEnabled"] as? Boolean) ?: false,
                     bionicFgEnabled = (savedMap["bionicFgEnabled"] as? Boolean) ?: false,
                     xrRenderScale = (savedMap["xrRenderScale"] as? Int) ?: 100,
+                    xrFramePacingDivisor = (savedMap["xrFramePacingDivisor"] as? Int) ?: 1,
                     xrOpenCompositeEnabled = (savedMap["xrOpenCompositeEnabled"] as? Boolean) ?: true,
                     xrTheaterScreenEnabled = (savedMap["xrTheaterScreenEnabled"] as? Boolean) ?: true,
                     xrClockEnabled = (savedMap["xrClockEnabled"] as? Boolean) ?: true,

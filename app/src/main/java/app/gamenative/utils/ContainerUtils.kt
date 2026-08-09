@@ -373,6 +373,12 @@ object ContainerUtils {
                     XrContainerSettings.DEFAULT_RENDER_SCALE.toString(),
                 ).toIntOrNull(),
             ),
+            xrFramePacingDivisor = XrContainerSettings.sanitizeFramePacingDivisor(
+                container.getExtra(
+                    XrContainerSettings.FRAME_PACING_DIVISOR_EXTRA,
+                    XrContainerSettings.DEFAULT_FRAME_PACING_DIVISOR.toString(),
+                ).toIntOrNull(),
+            ),
             xrOpenCompositeEnabled = container.getExtra(
                 XrContainerSettings.OPENCOMPOSITE_EXTRA,
                 "true",
@@ -394,6 +400,7 @@ object ContainerUtils {
         val xr = XrContainerSettings.read(context, container.id, container)
         return data.copy(
             xrRenderScale = xr.renderScale,
+            xrFramePacingDivisor = xr.framePacingDivisor,
             xrOpenCompositeEnabled = xr.openCompositeEnabled,
             xrTheaterScreenEnabled = xr.theaterScreenEnabled,
             xrClockEnabled = xr.clockEnabled,

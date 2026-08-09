@@ -112,6 +112,18 @@ class QuestVrActivity : ComponentActivity() {
                 } else {
                     persisted.renderScale
                 },
+                framePacingDivisor = if (
+                    intent.hasExtra(QuestVrLauncher.EXTRA_FRAME_PACING_DIVISOR)
+                ) {
+                    XrContainerSettings.sanitizeFramePacingDivisor(
+                        intent.getIntExtra(
+                            QuestVrLauncher.EXTRA_FRAME_PACING_DIVISOR,
+                            persisted.framePacingDivisor,
+                        ),
+                    )
+                } else {
+                    persisted.framePacingDivisor
+                },
                 openCompositeEnabled = if (intent.hasExtra(QuestVrLauncher.EXTRA_OPENCOMPOSITE)) {
                     intent.getBooleanExtra(
                         QuestVrLauncher.EXTRA_OPENCOMPOSITE,
@@ -139,11 +151,13 @@ class QuestVrActivity : ComponentActivity() {
         }.getOrDefault(XrContainerSettings.Values())
         val settingsSummary =
             "renderScale=${xrContainerSettings.renderScale}% " +
+                "framePacing=${xrContainerSettings.framePacingDivisor}:1 " +
                 "openComposite=${xrContainerSettings.openCompositeEnabled} " +
                 "theater=${xrContainerSettings.theaterScreenEnabled} " +
                 "clock=${xrContainerSettings.clockEnabled}"
         Timber.i("GameNativeVR container settings: $settingsSummary")
         XrLaunchDiagnostics.record(this, "VR container settings: $settingsSummary")
+        bridgeServer.setFramePacingDivisor(xrContainerSettings.framePacingDivisor)
         bridgeServer.onHaptic = { hand, amplitude, durationNs, frequency ->
             val handle = nativeXrHandle
             if (handle != 0L) {

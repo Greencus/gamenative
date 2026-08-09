@@ -19,6 +19,7 @@ fun VrTabContent(
 ) {
     val config = state.config.value
     val renderScales = XrContainerSettings.renderScaleOptions
+    val framePacingDivisors = XrContainerSettings.framePacingDivisorOptions
 
     SettingsGroup {
         SettingsListDropdown(
@@ -29,6 +30,23 @@ fun VrTabContent(
             items = renderScales.map { "$it%" },
             onItemSelected = { index ->
                 val updated = state.config.value.copy(xrRenderScale = renderScales[index])
+                state.config.value = updated
+                onConfigChanged(updated)
+            },
+        )
+        SettingsListDropdown(
+            colors = settingsTileColorsAlt(),
+            title = { Text(text = stringResource(R.string.vr_frame_pacing)) },
+            subtitle = { Text(text = stringResource(R.string.vr_frame_pacing_description)) },
+            value = framePacingDivisors.indexOf(config.xrFramePacingDivisor).coerceAtLeast(0),
+            items = listOf(
+                stringResource(R.string.vr_frame_pacing_native),
+                stringResource(R.string.vr_frame_pacing_half),
+            ),
+            onItemSelected = { index ->
+                val updated = state.config.value.copy(
+                    xrFramePacingDivisor = framePacingDivisors[index],
+                )
                 state.config.value = updated
                 onConfigChanged(updated)
             },

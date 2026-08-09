@@ -3635,7 +3635,6 @@ private fun setupXEnvironment(
     val enableWineDebug = PrefManager.enableWineDebug
     val enableBox86Logs = WinlatorPrefManager.getBoolean("enable_box86_64_logs", false)
     val wineDebugChannels = PrefManager.wineDebugChannels
-    val xrDiagnostics = context is QuestVrActivity
     // explicitly enable or disable Wine debug channels
     if (diagnostics) {
         envVars.put("WRAPPER_DIAG", "1")
@@ -3650,16 +3649,15 @@ private fun setupXEnvironment(
             when {
                 enableWineDebug && wineDebugChannels.isNotEmpty() ->
                     "+" + wineDebugChannels.replace(",", ",+")
-                xrDiagnostics -> "+timestamp,+pid,+module,+loaddll"
                 else -> "-all"
             },
         )
     }
-    // capture debug output to file if either Wine or Box86/64 logging is enabled
-    // Capture debug output for every VR launch, independently of the global
-    // developer logging preference.
+    // Normal VR launches must not force Wine module tracing. It is extremely chatty and
+    // adds avoidable CPU and storage I/O jitter to the render path. Diagnostic Run keeps
+    // the detailed capture available when it is explicitly requested.
     var logFile: File? = null
-    val captureLogs = enableWineDebug || enableBox86Logs || xrDiagnostics
+    val captureLogs = diagnostics || enableWineDebug || enableBox86Logs
     if (captureLogs) {
         val wineLogDir = File(context.getExternalFilesDir(null), "wine_logs")
         wineLogDir.mkdirs()
@@ -3667,8 +3665,8 @@ private fun setupXEnvironment(
         if (logFile.exists()) logFile.delete()
     }
 
-    ProcessHelper.addDebugCallback { line ->
-        if (captureLogs) {
+    if (captureLogs) {
+        ProcessHelper.addDebugCallback { line ->
             logFile?.appendText(line + "\n")
         }
     }

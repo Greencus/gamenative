@@ -9,21 +9,26 @@ object XrContainerSettings {
     internal const val PREFERENCES_NAME = "gamenative_xr_container_settings"
     private const val STORED_SUFFIX = "stored"
     private const val RENDER_SCALE_SUFFIX = "renderScale"
+    private const val FRAME_PACING_DIVISOR_SUFFIX = "framePacingDivisor"
     private const val OPENCOMPOSITE_SUFFIX = "openComposite"
     private const val THEATER_SCREEN_SUFFIX = "theaterScreen"
     private const val CLOCK_SUFFIX = "clock"
 
     const val RENDER_SCALE_EXTRA = "xrRenderScale"
+    const val FRAME_PACING_DIVISOR_EXTRA = "xrFramePacingDivisor"
     const val OPENCOMPOSITE_EXTRA = "xrOpenCompositeEnabled"
     const val THEATER_SCREEN_EXTRA = "xrTheaterScreenEnabled"
     const val CLOCK_EXTRA = "xrClockEnabled"
 
     const val DEFAULT_RENDER_SCALE = 100
+    const val DEFAULT_FRAME_PACING_DIVISOR = 1
 
     val renderScaleOptions = listOf(50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150)
+    val framePacingDivisorOptions = listOf(1, 2)
 
     data class Values(
         val renderScale: Int = DEFAULT_RENDER_SCALE,
+        val framePacingDivisor: Int = DEFAULT_FRAME_PACING_DIVISOR,
         val openCompositeEnabled: Boolean = true,
         val theaterScreenEnabled: Boolean = true,
         val clockEnabled: Boolean = true,
@@ -32,6 +37,12 @@ object XrContainerSettings {
     fun read(container: Container): Values = Values(
         renderScale = sanitizeRenderScale(
             container.getExtra(RENDER_SCALE_EXTRA, DEFAULT_RENDER_SCALE.toString()).toIntOrNull(),
+        ),
+        framePacingDivisor = sanitizeFramePacingDivisor(
+            container.getExtra(
+                FRAME_PACING_DIVISOR_EXTRA,
+                DEFAULT_FRAME_PACING_DIVISOR.toString(),
+            ).toIntOrNull(),
         ),
         openCompositeEnabled = readBoolean(container, OPENCOMPOSITE_EXTRA, true),
         theaterScreenEnabled = readBoolean(container, THEATER_SCREEN_EXTRA, true),
@@ -54,6 +65,12 @@ object XrContainerSettings {
             renderScale = sanitizeRenderScale(
                 preferences.getInt(key(appId, RENDER_SCALE_SUFFIX), DEFAULT_RENDER_SCALE),
             ),
+            framePacingDivisor = sanitizeFramePacingDivisor(
+                preferences.getInt(
+                    key(appId, FRAME_PACING_DIVISOR_SUFFIX),
+                    DEFAULT_FRAME_PACING_DIVISOR,
+                ),
+            ),
             openCompositeEnabled = preferences.getBoolean(key(appId, OPENCOMPOSITE_SUFFIX), true),
             theaterScreenEnabled = preferences.getBoolean(key(appId, THEATER_SCREEN_SUFFIX), true),
             clockEnabled = preferences.getBoolean(key(appId, CLOCK_SUFFIX), true),
@@ -62,6 +79,7 @@ object XrContainerSettings {
 
     fun from(data: ContainerData): Values = Values(
         renderScale = sanitizeRenderScale(data.xrRenderScale),
+        framePacingDivisor = sanitizeFramePacingDivisor(data.xrFramePacingDivisor),
         openCompositeEnabled = data.xrOpenCompositeEnabled,
         theaterScreenEnabled = data.xrTheaterScreenEnabled,
         clockEnabled = data.xrClockEnabled,
@@ -69,6 +87,10 @@ object XrContainerSettings {
 
     fun write(container: Container, values: Values) {
         container.putExtra(RENDER_SCALE_EXTRA, sanitizeRenderScale(values.renderScale).toString())
+        container.putExtra(
+            FRAME_PACING_DIVISOR_EXTRA,
+            sanitizeFramePacingDivisor(values.framePacingDivisor).toString(),
+        )
         container.putExtra(OPENCOMPOSITE_EXTRA, values.openCompositeEnabled.toString())
         container.putExtra(THEATER_SCREEN_EXTRA, values.theaterScreenEnabled.toString())
         container.putExtra(CLOCK_EXTRA, values.clockEnabled.toString())
@@ -76,10 +98,14 @@ object XrContainerSettings {
 
     /** Synchronously persist a complete settings snapshot before a launch can begin. */
     fun persist(context: Context, appId: String, values: Values): Boolean {
-        val sanitized = values.copy(renderScale = sanitizeRenderScale(values.renderScale))
+        val sanitized = values.copy(
+            renderScale = sanitizeRenderScale(values.renderScale),
+            framePacingDivisor = sanitizeFramePacingDivisor(values.framePacingDivisor),
+        )
         return context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
             .edit()
             .putInt(key(appId, RENDER_SCALE_SUFFIX), sanitized.renderScale)
+            .putInt(key(appId, FRAME_PACING_DIVISOR_SUFFIX), sanitized.framePacingDivisor)
             .putBoolean(key(appId, OPENCOMPOSITE_SUFFIX), sanitized.openCompositeEnabled)
             .putBoolean(key(appId, THEATER_SCREEN_SUFFIX), sanitized.theaterScreenEnabled)
             .putBoolean(key(appId, CLOCK_SUFFIX), sanitized.clockEnabled)
@@ -90,12 +116,16 @@ object XrContainerSettings {
     fun sanitizeRenderScale(value: Int?): Int =
         value?.takeIf(renderScaleOptions::contains) ?: DEFAULT_RENDER_SCALE
 
+    fun sanitizeFramePacingDivisor(value: Int?): Int =
+        value?.takeIf(framePacingDivisorOptions::contains) ?: DEFAULT_FRAME_PACING_DIVISOR
+
     /**
      * VR settings are persistent container preferences, not launch-intent overrides. Preserve
      * them whenever a temporary launch configuration is merged with the saved container data.
      */
     fun preserveFrom(base: ContainerData, candidate: ContainerData): ContainerData = candidate.copy(
         xrRenderScale = base.xrRenderScale,
+        xrFramePacingDivisor = base.xrFramePacingDivisor,
         xrOpenCompositeEnabled = base.xrOpenCompositeEnabled,
         xrTheaterScreenEnabled = base.xrTheaterScreenEnabled,
         xrClockEnabled = base.xrClockEnabled,

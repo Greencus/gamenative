@@ -65,6 +65,7 @@ class XrBridgeServer {
     private val lastStatusPublishNs = AtomicLong(0L)
     private val framePacingLock = Object()
     private val framePacingAnnounced = AtomicBoolean(false)
+    @Volatile private var framePacingDivisor = 1
     private var frameSequence = 0L
     private var lastDeliveredFrameSequence = 0L
 
@@ -75,7 +76,12 @@ class XrBridgeServer {
         "connected=${if (clientConnected) 1 else 0} state=$sessionState gfx=$gfxApi " +
             "swapchains=${activeSwapchains.get()}/$swapchainRequests " +
             "frames=${submittedFrames.get()} command=${lastCommand.ifEmpty { "none" }} " +
+            "pacing=${framePacingDivisor}:1 " +
             "error=${lastError.ifEmpty { "none" }}"
+
+    fun setFramePacingDivisor(value: Int) {
+        framePacingDivisor = value.coerceIn(1, 2)
+    }
 
     private fun publishStatus(force: Boolean = false) {
         val now = System.nanoTime()
@@ -259,11 +265,16 @@ class XrBridgeServer {
      * OpenXR requires xrWaitFrame to pace the application. Returning the latest timestamp
      * immediately allows the Windows game to render unbounded and build a deep DXVK queue,
      * which wastes power and turns small timing variations into visible latency spikes.
-     * Wake one game frame for each frame produced by the native Quest XR loop instead.
+     * Wake the game on compositor-aligned intervals from the native Quest XR loop instead.
+     * A divisor of two intentionally produces an even half-refresh cadence while the Quest
+     * compositor continues to timewarp the most recent submitted projection layer.
      */
     private fun waitFrameResponse(): String {
         val response = synchronized(framePacingLock) {
-            while (running.get() && frameSequence <= lastDeliveredFrameSequence) {
+            while (
+                running.get() &&
+                frameSequence - lastDeliveredFrameSequence < framePacingDivisor
+            ) {
                 try {
                     framePacingLock.wait(250L)
                 } catch (_: InterruptedException) {
@@ -274,11 +285,14 @@ class XrBridgeServer {
             if (frameSequence > lastDeliveredFrameSequence) {
                 lastDeliveredFrameSequence = frameSequence
             }
-            "OK time=${predictedDisplayTime.get()} period=${predictedDisplayPeriod.get()} " +
+            val applicationPeriod = predictedDisplayPeriod.get() * framePacingDivisor
+            "OK time=${predictedDisplayTime.get()} period=$applicationPeriod " +
                 "render=${if (shouldRender) 1 else 0} state=$sessionState"
         }
         if (framePacingAnnounced.compareAndSet(false, true)) {
-            onDiagnosticEvent?.invoke("OpenXR game frame pacing active")
+            onDiagnosticEvent?.invoke(
+                "OpenXR game frame pacing active (${framePacingDivisor}:1)",
+            )
         }
         return response
     }

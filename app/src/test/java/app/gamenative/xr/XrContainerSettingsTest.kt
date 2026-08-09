@@ -36,9 +36,18 @@ class XrContainerSettingsTest {
     }
 
     @Test
+    fun `frame pacing accepts native and half refresh only`() {
+        assertEquals(1, XrContainerSettings.sanitizeFramePacingDivisor(1))
+        assertEquals(2, XrContainerSettings.sanitizeFramePacingDivisor(2))
+        assertEquals(1, XrContainerSettings.sanitizeFramePacingDivisor(3))
+        assertEquals(1, XrContainerSettings.sanitizeFramePacingDivisor(null))
+    }
+
+    @Test
     fun `temporary configuration merge preserves saved VR settings`() {
         val saved = ContainerData(
             xrRenderScale = 60,
+            xrFramePacingDivisor = 2,
             xrOpenCompositeEnabled = false,
             xrTheaterScreenEnabled = false,
             xrClockEnabled = false,
@@ -46,6 +55,7 @@ class XrContainerSettingsTest {
         val temporaryCandidate = ContainerData(
             name = "temporary launch config",
             xrRenderScale = 150,
+            xrFramePacingDivisor = 1,
             xrOpenCompositeEnabled = true,
             xrTheaterScreenEnabled = true,
             xrClockEnabled = true,
@@ -55,6 +65,7 @@ class XrContainerSettingsTest {
 
         assertEquals("temporary launch config", merged.name)
         assertEquals(60, merged.xrRenderScale)
+        assertEquals(2, merged.xrFramePacingDivisor)
         assertEquals(false, merged.xrOpenCompositeEnabled)
         assertEquals(false, merged.xrTheaterScreenEnabled)
         assertEquals(false, merged.xrClockEnabled)
@@ -69,6 +80,7 @@ class XrContainerSettingsTest {
         val container = Container("STEAM_620980").apply { setRootDir(root) }
         val requested = XrContainerSettings.Values(
             renderScale = 60,
+            framePacingDivisor = 2,
             openCompositeEnabled = false,
             theaterScreenEnabled = false,
             clockEnabled = false,
@@ -90,6 +102,7 @@ class XrContainerSettingsTest {
         val container = Container("STEAM_620980")
         val requested = XrContainerSettings.Values(
             renderScale = 60,
+            framePacingDivisor = 2,
             openCompositeEnabled = false,
             theaterScreenEnabled = false,
             clockEnabled = false,
