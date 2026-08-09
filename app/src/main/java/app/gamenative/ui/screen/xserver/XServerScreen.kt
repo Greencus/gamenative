@@ -274,6 +274,50 @@ private fun detectMaxRefreshRateHz(context: Context, attachedView: View?): Int {
         ?: DEFAULT_FPS_LIMITER_MAX_HZ
 }
 
+private fun toggleSystemSoftInput(context: Context) {
+    ContextCompat.getSystemService(context, InputMethodManager::class.java)
+        ?.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+}
+
+private fun requestSoftKeyboard(
+    anchor: View,
+    receiver: app.gamenative.externaldisplay.IMEInputReceiver?,
+    analyticsEvent: String? = null,
+    delayForModernAndroid: Boolean = false,
+) {
+    anchor.post {
+        if (anchor.windowToken == null) return@post
+        val show = {
+            if (analyticsEvent != null && PrefManager.usageAnalyticsEnabled) {
+                PostHog.capture(event = analyticsEvent)
+            }
+            val isExternalDisplaySession =
+                (anchor.display?.displayId ?: Display.DEFAULT_DISPLAY) != Display.DEFAULT_DISPLAY
+            if (isExternalDisplaySession && receiver != null) {
+                receiver.showKeyboard()
+            } else {
+                toggleSystemSoftInput(anchor.context)
+            }
+        }
+        if (delayForModernAndroid && Build.VERSION.SDK_INT > 29) {
+            anchor.postDelayed(show, 500)
+        } else {
+            show()
+        }
+    }
+}
+
+private fun hideSystemSoftInput(view: View) {
+    view.post {
+        if (Build.VERSION.SDK_INT >= 30) {
+            view.windowInsetsController?.hide(WindowInsets.Type.ime())
+        } else if (view.windowToken != null) {
+            ContextCompat.getSystemService(view.context, InputMethodManager::class.java)
+                ?.hideSoftInputFromWindow(view.windowToken, 0)
+        }
+    }
+}
+
 private data class XServerViewReleaseBinding(
     val xServerView: XServerRendererView,
     val windowModificationListener: WindowManager.OnWindowModificationListener,
@@ -367,9 +411,6 @@ fun XServerScreen(
     val context = LocalContext.current
     val view = LocalView.current
     val scope = rememberCoroutineScope()
-    val imm = remember(context) {
-        context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-    }
 
     // PluviaApp.events.emit(AndroidEvent.SetAppBarVisibility(false))
     PluviaApp.events.emit(AndroidEvent.SetSystemUIVisibility(false))
@@ -1078,36 +1119,16 @@ fun XServerScreen(
         }
     }
 
-    // Shows the soft keyboard, anchored to [anchor]. Handles the Android 12+
-    // post-delay quirk and routes input to the external display IME when needed.
-    val showSoftKeyboard: (View, String) -> Unit = { anchor, analyticsEvent ->
-        anchor.post {
-            if (anchor.windowToken != null) {
-                val show = {
-                    if (PrefManager.usageAnalyticsEnabled) PostHog.capture(event = analyticsEvent)
-                    val isExternalDisplaySession =
-                        (anchor.display?.displayId ?: Display.DEFAULT_DISPLAY) != Display.DEFAULT_DISPLAY
-
-                    if (isExternalDisplaySession) {
-                        imeInputReceiver?.showKeyboard() ?: imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                    } else {
-                        imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                    }
-                }
-                if (Build.VERSION.SDK_INT > 29) {
-                    anchor.postDelayed({ show() }, 500)  // Pixel/Android-12+ quirk
-                } else {
-                    show()
-                }
-            }
-        }
-    }
-
     val onQuickMenuItemSelected: (Int) -> Boolean = { itemId ->
         when (itemId) {
             QuickMenuAction.KEYBOARD -> {
                 keyboardRequestedFromOverlay = true
-                showSoftKeyboard(view, "onscreen_keyboard_enabled")
+                requestSoftKeyboard(
+                    view,
+                    imeInputReceiver,
+                    analyticsEvent = "onscreen_keyboard_enabled",
+                    delayForModernAndroid = true,
+                )
                 true
             }
 
@@ -1351,14 +1372,7 @@ fun XServerScreen(
         if (imeVisible) {
             if (PrefManager.usageAnalyticsEnabled) PostHog.capture(event = "onscreen_keyboard_disabled")
             imeInputReceiver?.hideKeyboard()
-            view.post {
-                if (Build.VERSION.SDK_INT >= 30) {
-                    view.windowInsetsController?.hide(WindowInsets.Type.ime())
-                } else {
-                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                    if (view.windowToken != null) imm.hideSoftInputFromWindow(view.windowToken, 0)
-                }
-            }
+            hideSystemSoftInput(view)
             return@gameBack
         }
 
@@ -1892,17 +1906,7 @@ fun XServerScreen(
                 // a direct touch interaction and should respond immediately.
                 PluviaApp.touchpadView?.setShowKeyboardCallback {
                     val anchor = PluviaApp.touchpadView ?: return@setShowKeyboardCallback
-                    anchor.post {
-                        if (anchor.windowToken == null) return@post
-                        val isExternalDisplaySession =
-                            (anchor.display?.displayId ?: android.view.Display.DEFAULT_DISPLAY) != android.view.Display.DEFAULT_DISPLAY
-                        if (isExternalDisplaySession) {
-                            imeInputReceiver?.showKeyboard()
-                                ?: imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                        } else {
-                            imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                        }
-                    }
+                    requestSoftKeyboard(anchor, imeInputReceiver)
                 }
 
                 // Wire click highlight + gesture debug listener
@@ -2360,7 +2364,12 @@ fun XServerScreen(
 
             // Wire SHOW_KEYBOARD binding callback for overlay control buttons
             icView.setShowKeyboardCallback {
-                showSoftKeyboard(icView, "onscreen_keyboard_enabled_from_binding")
+                requestSoftKeyboard(
+                    icView,
+                    imeInputReceiver,
+                    analyticsEvent = "onscreen_keyboard_enabled_from_binding",
+                    delayForModernAndroid = true,
+                )
             }
 
             xServerView.getxServer().winHandler.setInputControlsView(PluviaApp.inputControlsView)
