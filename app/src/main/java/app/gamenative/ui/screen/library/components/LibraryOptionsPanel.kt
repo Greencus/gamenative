@@ -233,6 +233,25 @@ fun LibraryOptionsPanel(
 
                         Spacer(modifier = Modifier.height(20.dp))
 
+                        OptionSectionHeader(text = stringResource(R.string.library_game_features))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusGroup()
+                                .padding(horizontal = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            OptionListItem(
+                                text = stringResource(AppFilter.VR.displayTextRes),
+                                selected = selectedFilters.contains(AppFilter.VR),
+                                onClick = { onFilterChanged(AppFilter.VR) },
+                                icon = AppFilter.VR.icon,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
                         OptionSectionHeader(text = stringResource(R.string.library_app_status))
                         Column(
                             modifier = Modifier

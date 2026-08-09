@@ -18,7 +18,7 @@ typedef unsigned long long gn_u64;
 typedef signed long long gn_i64;
 #endif
 
-#define GN_UNIX_ABI_VERSION 3u
+#define GN_UNIX_ABI_VERSION 4u
 #define GN_UNIX_MAX_SWAPCHAINS 32u
 #define GN_UNIX_MAX_IMAGES 4u
 
@@ -41,6 +41,16 @@ enum gn_unix_result {
     GN_UNIX_ERROR_TIMEOUT = -5
 };
 
+enum gn_unix_vulkan_diagnostic_flag {
+    GN_UNIX_VK_DIAG_PHYSICAL_DEVICE = 1u << 0,
+    GN_UNIX_VK_DIAG_DEVICE = 1u << 1,
+    GN_UNIX_VK_DIAG_QUEUE = 1u << 2,
+    GN_UNIX_VK_DIAG_VULKAN_LIBRARY = 1u << 3,
+    GN_UNIX_VK_DIAG_GET_DEVICE_PROC_ADDR = 1u << 4,
+    GN_UNIX_VK_DIAG_CREATE_IMAGE = 1u << 5,
+    GN_UNIX_VK_DIAG_GET_MEMORY_FD = 1u << 6
+};
+
 #pragma pack(push, 1)
 struct gn_unix_init_args {
     gn_u32 abi_version;
@@ -54,6 +64,7 @@ struct gn_unix_vulkan_context_args {
     gn_u32 queue_family_index;
     gn_u32 queue_index;
     gn_u32 handles_are_host;
+    gn_u32 diagnostic_flags;
     gn_i32 result;
 };
 

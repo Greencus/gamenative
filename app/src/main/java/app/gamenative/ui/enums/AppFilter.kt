@@ -8,6 +8,7 @@ import androidx.compose.material.icons.filled.Diversity3
 import androidx.compose.material.icons.filled.HourglassEmpty
 import androidx.compose.material.icons.filled.InstallMobile
 import androidx.compose.material.icons.filled.VideogameAsset
+import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.SportsEsports
 import androidx.compose.material.icons.rounded.Star
@@ -83,6 +84,11 @@ enum class AppFilter(
         code = 0x400,
         displayTextRes = R.string.filter_proven_gpu,
         icon = Icons.Rounded.SportsEsports,
+    ),
+    VR(
+        code = 0x1000,
+        displayTextRes = R.string.app_filter_vr_game,
+        icon = Icons.Default.ViewInAr,
     ),
     // ALPHABETIC(
     //     code = 0x20,

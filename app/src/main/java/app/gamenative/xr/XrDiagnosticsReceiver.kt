@@ -13,7 +13,14 @@ import android.util.Log
  */
 class XrDiagnosticsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val status = XrBridgeServer.activeStatus
+        val status = buildString {
+            appendLine(XrBridgeServer.activeStatus)
+            val recentLaunchLog = XrLaunchDiagnostics.readRecent(context)
+            if (recentLaunchLog.isNotBlank()) {
+                appendLine("RECENT LAUNCH LOG:")
+                append(recentLaunchLog)
+            }
+        }.trim()
         Log.i("GameNativeVR", "STATUS $status")
         resultCode = 0
         resultData = status

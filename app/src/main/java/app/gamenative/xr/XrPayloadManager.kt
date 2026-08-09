@@ -29,10 +29,13 @@ object XrPayloadManager {
 
     private const val BRIDGE_DLL_64 = "gamenative_openxr64.dll"
     private const val BRIDGE_DLL_32 = "gamenative_openxr32.dll"
+    private const val BRIDGE_DLL_COMMON = "gamenative_openxr.dll"
     private const val BRIDGE_UNIXLIB = "gamenative_openxr.so"
+    private const val UNIX_BRIDGE_DLL_ARM64X = "gamenative_xr_unixbridge_arm64x.dll"
     private const val UNIX_BRIDGE_DLL_64 = "gamenative_xr_unixbridge64.dll"
     private const val UNIX_BRIDGE_DLL_32 = "gamenative_xr_unixbridge32.dll"
     private const val UNIX_BRIDGE_MODULE = "gamenative_xr_unixbridge"
+    private val WINE_BUILTIN_SIGNATURE = "Wine builtin DLL\u0000".toByteArray(Charsets.US_ASCII)
     private const val PATCHED_WINE_IDENTIFIER = "wine-9.2-x86_64"
     private const val WINE_VULKAN_MODULE = "winevulkan.so"
     private const val WINE_VULKAN_BACKUP_SUFFIX = ".gamenative-stock"
@@ -44,12 +47,20 @@ object XrPayloadManager {
 
     suspend fun prepare(context: Context, container: Container, appId: String) = withContext(Dispatchers.IO) {
         prepareBridgePayload(context, container)
-        prepareUnixLib(context, container)
         if (XrRuntimeManager.isOpenCompositeEnabled(container)) {
             prepareOpenComposite(context, container, appId)
         } else {
             restorePerGameOpenComposite(container, appId)
         }
+    }
+
+    /**
+     * Install the Wine-owned half only after setupWineSystemFiles has finished.
+     * Proton installation/refresh replaces its lib/wine directories, so staging
+     * this payload during pre-launch dependency preparation is too early.
+     */
+    fun prepareWineRuntime(context: Context, container: Container) {
+        prepareUnixLib(context, container)
     }
 
     /**
@@ -86,68 +97,187 @@ object XrPayloadManager {
     fun bridgeDll32(container: Container): File =
         File(container.rootDir, ".wine/drive_c/gamenative/xr/$BRIDGE_DLL_32")
 
+    private fun systemBridgeDll64(container: Container): File =
+        File(container.rootDir, ".wine/drive_c/windows/system32/$BRIDGE_DLL_COMMON")
+
+    private fun systemBridgeDll32(container: Container): File =
+        File(container.rootDir, ".wine/drive_c/windows/syswow64/$BRIDGE_DLL_COMMON")
+
     fun hasBridgePayload(container: Container): Boolean =
-        bridgeDll64(container).isFile && bridgeDll32(container).isFile
+        bridgeDll64(container).isFile &&
+            bridgeDll32(container).isFile &&
+            systemBridgeDll64(container).peMachine() == PeMachine.X64 &&
+            systemBridgeDll32(container).peMachine() == PeMachine.X86
+
+    fun diagnosticSummary(context: Context, container: Container, appId: String): String {
+        val runtimeDir = File(container.rootDir, ".wine/drive_c/gamenative/xr")
+        val openCompositeDir =
+            File(container.rootDir, ".wine/drive_c/gamenative/opencomposite")
+        val system32 = File(container.rootDir, ".wine/drive_c/windows/system32")
+        val syswow64 = File(container.rootDir, ".wine/drive_c/windows/syswow64")
+        val d3d11 = File(system32, "d3d11.dll")
+        val dxgi = File(system32, "dxgi.dll")
+        val unixArch = unixArch(container)
+        val wineDir = wineInstallDir(context, container)
+        val wineUnixBridge =
+            File(wineDir, "lib/wine/$unixArch-unix/$UNIX_BRIDGE_MODULE.so")
+        val wineBridgeNative = File(
+            wineDir,
+            "lib/wine/${if (unixArch == "aarch64") "aarch64" else "x86_64"}-windows/" +
+                "$UNIX_BRIDGE_MODULE.dll",
+        )
+        val wineBridge32 =
+            File(wineDir, "lib/wine/i386-windows/$UNIX_BRIDGE_MODULE.dll")
+        val prefixBridge64 = File(system32, "$UNIX_BRIDGE_MODULE.dll")
+        val prefixBridge32 = File(syswow64, "$UNIX_BRIDGE_MODULE.dll")
+        val appDir = gameInstallDir(container, appId)
+        val openVrDlls = appDir
+            ?.walkTopDown()
+            ?.filter {
+                it.isFile &&
+                    (it.name.equals("openvr_api.dll", ignoreCase = true) ||
+                        it.name.endsWith(OPENVR_BACKUP_SUFFIX, ignoreCase = true))
+            }
+            ?.take(32)
+            ?.toList()
+            .orEmpty()
+
+        return buildString {
+            appendLine("GameNativeVR payload state:")
+            appendLine("  gameDir=${appDir?.absolutePath ?: "<unresolved>"}")
+            appendLine(
+                "  runtime64=${bridgeDll64(container).fileDescription()} " +
+                    "runtime32=${bridgeDll32(container).fileDescription()}",
+            )
+            appendLine(
+                "  systemRuntime64=${systemBridgeDll64(container).fileDescription()} " +
+                    "systemRuntime32=${systemBridgeDll32(container).fileDescription()}",
+            )
+            appendLine(
+                "  manifest64=${File(runtimeDir, "gamenative_openxr64.json").fileDescription()} " +
+                    "manifest32=${File(runtimeDir, "gamenative_openxr32.json").fileDescription()}",
+            )
+            appendLine("  openCompositeDir=${openCompositeDir.fileDescription()}")
+            appendLine(
+                "  graphicsDriver=${container.graphicsDriver} " +
+                    "effectiveVrDriver=${XrGraphicsPolicy.effectiveGraphicsDriver(container.graphicsDriver, true)} " +
+                    "dxwrapper=${container.dxWrapper} " +
+                    "effectiveVrDxWrapper=${XrGraphicsPolicy.effectiveDxWrapper(container.dxWrapper, true)}",
+            )
+            appendLine(
+                "  d3d11=${d3d11.fileDescription()} dxgi=${dxgi.fileDescription()} " +
+                    "dxvkInterop1=${d3d11.containsDxvkInterop1Guid() || dxgi.containsDxvkInterop1Guid()}",
+            )
+            appendLine(
+                "  wineVersion=${container.wineVersion} unixArch=$unixArch wineDir=${wineDir.path}",
+            )
+            appendLine(
+                "  wineUnixBridge=${wineUnixBridge.fileDescription()} " +
+                    "wineBridgeNative=${wineBridgeNative.fileDescription()} " +
+                    "nativeMachine=${wineBridgeNative.peMachine() ?: "unknown"} " +
+                    "nativeAlignment=${wineBridgeNative.peAlignment()?.let { "${it.first}/${it.second}" } ?: "unknown"} " +
+                    "nativeBuiltin=${wineBridgeNative.hasWineBuiltinSignature()} " +
+                    "wineBridge32=${wineBridge32.fileDescription()}",
+            )
+            appendLine(
+                "  prefixBridge64=${prefixBridge64.fileDescription()} " +
+                    "prefixBridge32=${prefixBridge32.fileDescription()}",
+            )
+            if (openVrDlls.isEmpty()) {
+                appendLine("  perGameOpenVrDlls=<none>")
+            } else {
+                openVrDlls.forEach { dll ->
+                    val relative = appDir?.let { root ->
+                        runCatching { dll.relativeTo(root).path }.getOrDefault(dll.path)
+                    } ?: dll.path
+                    appendLine(
+                        "  perGameOpenVrDll=$relative ${dll.fileDescription()} " +
+                            "machine=${dll.peMachine() ?: "unknown"} sha256=${dll.sha256()}",
+                    )
+                }
+            }
+            appendLine(XrRuntimeManager.diagnosticSummary(container))
+        }.trimEnd()
+    }
 
     private fun prepareBridgePayload(context: Context, container: Container) {
         val targetDir = File(container.rootDir, ".wine/drive_c/gamenative/xr").apply { mkdirs() }
         val assetDir = "xr/windows"
         copyAssetIfExists(context, "$assetDir/$BRIDGE_DLL_64", File(targetDir, BRIDGE_DLL_64))
         copyAssetIfExists(context, "$assetDir/$BRIDGE_DLL_32", File(targetDir, BRIDGE_DLL_32))
+        copyAssetIfExists(context, "$assetDir/$BRIDGE_DLL_64", systemBridgeDll64(container))
+        copyAssetIfExists(context, "$assetDir/$BRIDGE_DLL_32", systemBridgeDll32(container))
 
-        if (!File(targetDir, BRIDGE_DLL_64).isFile || !File(targetDir, BRIDGE_DLL_32).isFile) {
-            Timber.w(
-                "GameNativeVR OpenXR payload is incomplete in %s. Both x64 and x86 DLLs are required.",
-                targetDir.path,
+        if (!hasBridgePayload(container)) {
+            throw IOException(
+                "GameNativeVR OpenXR payload is incomplete. Both runtime-directory and " +
+                    "architecture-specific system DLLs are required.",
             )
         }
     }
 
     private fun prepareUnixLib(context: Context, container: Container) {
-        val unixArch = if (container.wineVersion.contains("arm64ec", ignoreCase = true)) {
-            "aarch64"
-        } else {
-            "x86_64"
-        }
+        val unixArch = unixArch(container)
+        val isArm64Ec = unixArch == "aarch64"
         val wineDir = wineInstallDir(context, container)
         val unixTarget = File(wineDir, "lib/wine/$unixArch-unix/$UNIX_BRIDGE_MODULE.so")
-        val x64Target = File(wineDir, "lib/wine/x86_64-windows/$UNIX_BRIDGE_MODULE.dll")
+        val nativeWindowsArch = if (isArm64Ec) "aarch64" else "x86_64"
+        val nativeAsset = if (isArm64Ec) UNIX_BRIDGE_DLL_ARM64X else UNIX_BRIDGE_DLL_64
+        val expectedNativeMachine = if (isArm64Ec) PeMachine.ARM64X else PeMachine.X64
+        val nativeTarget =
+            File(wineDir, "lib/wine/$nativeWindowsArch-windows/$UNIX_BRIDGE_MODULE.dll")
         val x86Target = File(wineDir, "lib/wine/i386-windows/$UNIX_BRIDGE_MODULE.dll")
-        val prefixX64Target =
+        val prefixNativeTarget =
             File(container.rootDir, ".wine/drive_c/windows/system32/$UNIX_BRIDGE_MODULE.dll")
         val prefixX86Target =
             File(container.rootDir, ".wine/drive_c/windows/syswow64/$UNIX_BRIDGE_MODULE.dll")
         copyAssetIfExists(context, "xr/unix/$unixArch/$BRIDGE_UNIXLIB", unixTarget)
-        copyAssetIfExists(context, "xr/windows/$UNIX_BRIDGE_DLL_64", x64Target)
+        if (isArm64Ec) {
+            // Builds before the ARM64X companion was available placed an aarch64
+            // ELF and an x64 PE in Wine's x86_64 directories. Those cannot form
+            // a builtin pair in ARM64EC Wine and can make module resolution pick
+            // the wrong architecture, so remove only our obsolete named files.
+            File(wineDir, "lib/wine/x86_64-unix/$UNIX_BRIDGE_MODULE.so").delete()
+            File(wineDir, "lib/wine/x86_64-windows/$UNIX_BRIDGE_MODULE.dll").delete()
+        }
+        copyAssetIfExists(context, "xr/windows/$nativeAsset", nativeTarget)
         copyAssetIfExists(context, "xr/windows/$UNIX_BRIDGE_DLL_32", x86Target)
-        copyAssetIfExists(context, "xr/windows/$UNIX_BRIDGE_DLL_64", prefixX64Target)
+        copyAssetIfExists(context, "xr/windows/$nativeAsset", prefixNativeTarget)
         copyAssetIfExists(context, "xr/windows/$UNIX_BRIDGE_DLL_32", prefixX86Target)
         if (!unixTarget.isFile || !unixTarget.hasElfMagic()) {
             throw IOException("Wine unixlib payload is missing or invalid: ${unixTarget.path}")
         }
-        if (x64Target.peMachine() != PeMachine.X64 ||
+        if (nativeTarget.peMachine() != expectedNativeMachine ||
+            (isArm64Ec && nativeTarget.peAlignment() != Pair(65536, 65536)) ||
+            !nativeTarget.hasWineBuiltinSignature() ||
             x86Target.peMachine() != PeMachine.X86 ||
-            prefixX64Target.peMachine() != PeMachine.X64 ||
-            prefixX86Target.peMachine() != PeMachine.X86
+            !x86Target.hasWineBuiltinSignature() ||
+            prefixNativeTarget.peMachine() != expectedNativeMachine ||
+            (isArm64Ec && prefixNativeTarget.peAlignment() != Pair(65536, 65536)) ||
+            !prefixNativeTarget.hasWineBuiltinSignature() ||
+            prefixX86Target.peMachine() != PeMachine.X86 ||
+            !prefixX86Target.hasWineBuiltinSignature()
         ) {
             throw IOException(
                 "Wine unix bridge PE payloads are missing or invalid: " +
-                    "${x64Target.path}, ${x86Target.path}, " +
-                    "${prefixX64Target.path}, ${prefixX86Target.path}",
+                    "${nativeTarget.path}, ${x86Target.path}, " +
+                    "${prefixNativeTarget.path}, ${prefixX86Target.path}",
             )
         }
         // Wine is spawned under the app UID, so owner-readable permissions are sufficient.
         unixTarget.setReadable(true, true)
-        x64Target.setReadable(true, true)
+        unixTarget.setExecutable(true, true)
+        nativeTarget.setReadable(true, true)
         x86Target.setReadable(true, true)
-        prefixX64Target.setReadable(true, true)
+        prefixNativeTarget.setReadable(true, true)
         prefixX86Target.setReadable(true, true)
         prepareWineVulkanInterop(context, container, wineDir)
         Timber.i(
-            "Installed GameNativeVR Wine unix bridge: %s (%s), %s, %s",
+            "Installed GameNativeVR Wine unix bridge: %s (%s), native=%s (%s), x86=%s",
             unixTarget.path,
             unixTarget.sha256(),
-            x64Target.path,
+            nativeTarget.path,
+            expectedNativeMachine,
             x86Target.path,
         )
     }
@@ -201,6 +331,13 @@ object XrPayloadManager {
         return wineInfo.path?.takeIf { it.isNotEmpty() }?.let(::File)
             ?: File(ImageFs.find(context).rootDir, "opt/wine")
     }
+
+    private fun unixArch(container: Container): String =
+        if (container.wineVersion.contains("arm64ec", ignoreCase = true)) {
+            "aarch64"
+        } else {
+            "x86_64"
+        }
 
     private fun copyAssetIfExists(context: Context, assetPath: String, target: File) {
         runCatching {
@@ -433,6 +570,42 @@ object XrPayloadManager {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    private fun File.fileDescription(): String = when {
+        isFile -> "file(${length()} bytes)"
+        isDirectory -> "directory"
+        else -> "missing"
+    }
+
+    private fun File.containsDxvkInterop1Guid(): Boolean {
+        if (!isFile) return false
+        // Binary little-endian form of IDXGIVkInteropDevice1:
+        // e2ef5fa5-dc21-4af7-90c4-f67ef6a09324
+        val needle = byteArrayOf(
+            0xa5.toByte(), 0x5f, 0xef.toByte(), 0xe2.toByte(),
+            0x21, 0xdc.toByte(), 0xf7.toByte(), 0x4a,
+            0x90.toByte(), 0xc4.toByte(), 0xf6.toByte(), 0x7e,
+            0xf6.toByte(), 0xa0.toByte(), 0x93.toByte(), 0x24,
+        )
+        return runCatching {
+            inputStream().buffered().use { input ->
+                var matched = 0
+                while (true) {
+                    val value = input.read()
+                    if (value < 0) return@use false
+                    val byte = value.toByte()
+                    matched = when {
+                        byte == needle[matched] -> matched + 1
+                        byte == needle[0] -> 1
+                        else -> 0
+                    }
+                    if (matched == needle.size) return@use true
+                }
+                @Suppress("UNREACHABLE_CODE")
+                false
+            }
+        }.getOrDefault(false)
+    }
+
     private fun assetSha256(context: Context, assetPath: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
         context.assets.open(assetPath).use { input ->
@@ -460,6 +633,7 @@ object XrPayloadManager {
     private enum class PeMachine {
         X86,
         X64,
+        ARM64X,
     }
 
     private fun File.peMachine(): PeMachine? = runCatching {
@@ -477,8 +651,39 @@ object XrPayloadManager {
             when (machine) {
                 0x014c -> PeMachine.X86
                 0x8664 -> PeMachine.X64
+                // ARM64X images use ARM64 in the physical PE header; the
+                // hybrid ARM64EC/x64 identity is carried in CHPE metadata.
+                0xaa64 -> PeMachine.ARM64X
+                0xa64e -> PeMachine.ARM64X
                 else -> null
             }
+        }
+    }.getOrNull()
+
+    /** Wine's loader recognizes builtin PE modules by this signature at DOS-stub offset 0x40. */
+    private fun File.hasWineBuiltinSignature(): Boolean = runCatching {
+        inputStream().use { input ->
+            input.channel.position(0x40)
+            val signature = ByteArray(WINE_BUILTIN_SIGNATURE.size)
+            input.read(signature) == signature.size && signature.contentEquals(WINE_BUILTIN_SIGNATURE)
+        }
+    }.getOrDefault(false)
+
+    /** Section/file alignment from the PE optional header. */
+    private fun File.peAlignment(): Pair<Int, Int>? = runCatching {
+        inputStream().use { input ->
+            val mz = ByteArray(64)
+            if (input.read(mz) != mz.size) return@runCatching null
+            if (mz[0] != 'M'.code.toByte() || mz[1] != 'Z'.code.toByte()) return@runCatching null
+            val peOffset = ByteBuffer.wrap(mz, 0x3c, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            if (peOffset < 0) return@runCatching null
+            // Optional header starts 24 bytes after the PE signature. Both
+            // PE32 and PE32+ store these two fields at offsets 32 and 36.
+            input.channel.position(peOffset.toLong() + 24 + 32)
+            val alignment = ByteArray(8)
+            if (input.read(alignment) != alignment.size) return@runCatching null
+            val fields = ByteBuffer.wrap(alignment).order(ByteOrder.LITTLE_ENDIAN)
+            Pair(fields.int, fields.int)
         }
     }.getOrNull()
 }

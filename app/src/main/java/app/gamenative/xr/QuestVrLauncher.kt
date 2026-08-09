@@ -3,10 +3,10 @@ package app.gamenative.xr
 import android.app.Activity
 import android.app.ActivityOptions
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.view.Display
+import app.gamenative.PluviaApp
 import app.gamenative.data.LaunchInfo
 
 object QuestVrLauncher {
@@ -19,6 +19,7 @@ object QuestVrLauncher {
     const val EXTRA_LAUNCH_WORKING_DIR = "app.gamenative.xr.LAUNCH_WORKING_DIR"
     const val EXTRA_LAUNCH_DESCRIPTION = "app.gamenative.xr.LAUNCH_DESCRIPTION"
     const val EXTRA_LAUNCH_TYPE = "app.gamenative.xr.LAUNCH_TYPE"
+    const val EXTRA_LAUNCH_ARGUMENTS = "app.gamenative.xr.LAUNCH_ARGUMENTS"
 
     fun launch(
         activity: Activity,
@@ -31,11 +32,15 @@ object QuestVrLauncher {
     ) {
         val displayId = getMainDisplayId(activity)
         require(displayId >= 0) { "Could not find the primary display for GameNativeVR launch" }
+        XrLaunchDiagnostics.begin(
+            context = activity,
+            appId = appId,
+            executable = resolvedExecutable,
+            arguments = launchInfo?.arguments.orEmpty(),
+        )
 
         val intent = Intent(activity, QuestVrActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_CLEAR_TASK or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(EXTRA_APP_ID, appId)
             putExtra(EXTRA_BOOT_TO_CONTAINER, bootToContainer)
@@ -47,13 +52,22 @@ object QuestVrLauncher {
                 putExtra(EXTRA_LAUNCH_WORKING_DIR, it.workingDir)
                 putExtra(EXTRA_LAUNCH_DESCRIPTION, it.description)
                 putExtra(EXTRA_LAUNCH_TYPE, it.type)
+                putExtra(EXTRA_LAUNCH_ARGUMENTS, it.arguments)
             }
         }
         val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
 
-        val launchContext = if (activity is ContextWrapper) activity.baseContext else activity
-        activity.finish()
-        launchContext.startActivity(intent, options.toBundle())
+        // Mark the handoff before MainActivity can enter its stopped/destroyed lifecycle. The
+        // library activity may be reclaimed under VR memory pressure, but it must not tear down
+        // the Wine environment owned by QuestVrActivity.
+        PluviaApp.isVrSessionActive = true
+        try {
+            activity.startActivity(intent, options.toBundle())
+        } catch (error: Exception) {
+            PluviaApp.isVrSessionActive = false
+            XrLaunchDiagnostics.record(activity, "Could not start VR activity: ${error.message}", error)
+            throw error
+        }
     }
 
     private fun getMainDisplayId(context: Context): Int {

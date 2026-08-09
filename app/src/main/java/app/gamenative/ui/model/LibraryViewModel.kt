@@ -44,6 +44,7 @@ import app.gamenative.utils.GameCompatibilityCache
 import app.gamenative.utils.GameCompatibilityService
 import app.gamenative.utils.HardwareUtils
 import app.gamenative.utils.unaccent
+import app.gamenative.xr.XrLaunchPreferences
 import com.winlator.core.GPUInformation
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -477,6 +478,7 @@ class LibraryViewModel @Inject constructor(
 
             val currentState = _state.value
             val currentFilter = AppFilter.getAppType(currentState.appInfoSortType)
+            val vrOnly = currentState.appInfoSortType.contains(AppFilter.VR)
 
             // Fetch download directory apps once on IO thread and cache as a HashSet for O(1) lookups
             val downloadDirectoryApps = DownloadService.getDownloadDirectoryApps() + SteamService.getImportedAppDirs()
@@ -509,6 +511,9 @@ class LibraryViewModel @Inject constructor(
                 }
                 .filter { item ->
                     currentFilter.any { item.type == it }
+                }
+                .filter { item ->
+                    !vrOnly || XrLaunchPreferences.hasWindowsVrLaunchOption(item.config.launch)
                 }
                 .filter { item ->
                     if (currentState.appInfoSortType.contains(AppFilter.SHARED)) {
@@ -591,7 +596,7 @@ class LibraryViewModel @Inject constructor(
 
             // Scan Custom Games roots and create UI items (filtered by search query inside scanner)
             // Only include custom games if GAME filter is selected
-            val customGameItems = if (currentState.appInfoSortType.contains(AppFilter.GAME)) {
+            val customGameItems = if (!vrOnly && currentState.appInfoSortType.contains(AppFilter.GAME)) {
                 CustomGameScanner.scanAsLibraryItems(
                     query = currentState.searchQuery,
                 )
@@ -818,10 +823,12 @@ class LibraryViewModel @Inject constructor(
 
             val combined = buildList {
                 if (includeSteam) addAll(steamEntries)
-                if (includeOpen) addAll(customEntries)
-                if (includeGOG) addAll(gogEntries)
-                if (includeEpic) addAll(epicEntries)
-                if (includeAmazon) addAll(amazonEntries)
+                if (!vrOnly) {
+                    if (includeOpen) addAll(customEntries)
+                    if (includeGOG) addAll(gogEntries)
+                    if (includeEpic) addAll(epicEntries)
+                    if (includeAmazon) addAll(amazonEntries)
+                }
             }.sortedWith(sortComparator).mapIndexed { idx, entry ->
                 entry.item.copy(index = idx, isInstalled = entry.isInstalled)
             }
@@ -844,6 +851,7 @@ class LibraryViewModel @Inject constructor(
                 && PrefManager.showRecommendations
                 && currentTab == LibraryTab.ALL
                 && currentState.searchQuery.isEmpty()
+                && !vrOnly
             ) {
                 val recItem = LibraryItem(
                     index = -1,
@@ -878,15 +886,15 @@ class LibraryViewModel @Inject constructor(
                     // Per-source counts for tab badges
                     // Use user prefs + auth state only (not current tab) so badges stay stable across tab switches
                     allCount = (if (currentState.showSteamInLibrary) steamEntries.size else 0) +
-                        (if (currentState.showCustomGamesInLibrary) customEntries.size else 0) +
-                        (if (currentState.showGOGInLibrary && GOGService.hasStoredCredentials(context)) gogEntries.size else 0) +
-                        (if (currentState.showEpicInLibrary && EpicService.hasStoredCredentials(context)) epicEntries.size else 0) +
-                        (if (currentState.showAmazonInLibrary && AmazonService.hasStoredCredentials(context)) amazonEntries.size else 0),
+                        (if (!vrOnly && currentState.showCustomGamesInLibrary) customEntries.size else 0) +
+                        (if (!vrOnly && currentState.showGOGInLibrary && GOGService.hasStoredCredentials(context)) gogEntries.size else 0) +
+                        (if (!vrOnly && currentState.showEpicInLibrary && EpicService.hasStoredCredentials(context)) epicEntries.size else 0) +
+                        (if (!vrOnly && currentState.showAmazonInLibrary && AmazonService.hasStoredCredentials(context)) amazonEntries.size else 0),
                     steamCount = if (currentState.showSteamInLibrary) steamEntries.size else 0,
-                    gogCount = if (currentState.showGOGInLibrary && GOGService.hasStoredCredentials(context)) gogEntries.size else 0,
-                    epicCount = if (currentState.showEpicInLibrary && EpicService.hasStoredCredentials(context)) epicEntries.size else 0,
-                    amazonCount = if (currentState.showAmazonInLibrary && AmazonService.hasStoredCredentials(context)) amazonEntries.size else 0,
-                    localCount = if (currentState.showCustomGamesInLibrary) customEntries.size else 0,
+                    gogCount = if (!vrOnly && currentState.showGOGInLibrary && GOGService.hasStoredCredentials(context)) gogEntries.size else 0,
+                    epicCount = if (!vrOnly && currentState.showEpicInLibrary && EpicService.hasStoredCredentials(context)) epicEntries.size else 0,
+                    amazonCount = if (!vrOnly && currentState.showAmazonInLibrary && AmazonService.hasStoredCredentials(context)) amazonEntries.size else 0,
+                    localCount = if (!vrOnly && currentState.showCustomGamesInLibrary) customEntries.size else 0,
                 )
             }
         }

@@ -209,6 +209,9 @@ class PluviaApp : SplitCompatApplication() {
         var isOverlayPaused by mutableStateOf(false)
         @Volatile
         var isActivityInForeground: Boolean = true
+        /** True from the XR launch handoff until QuestVrActivity completes teardown. */
+        @Volatile
+        var isVrSessionActive: Boolean = false
 
         // Active runtime suspend policy for the current in-game session.
         var activeSuspendPolicy: String = Container.SUSPEND_POLICY_MANUAL

@@ -95,7 +95,6 @@
             android:exported="true"
             android:label="@string/gamenative_vr_name"
             android:launchMode="singleTop"
-            android:process=":vr_process"
             android:resizeableActivity="false"
             android:screenOrientation="landscape"
             android:theme="@style/Theme.Pluvia">
@@ -190,8 +189,7 @@
 
         <receiver
             android:name=".xr.XrDiagnosticsReceiver"
-            android:exported="true"
-            android:process=":vr_process">
+            android:exported="true">
             <intent-filter>
                 <action android:name="app.gamenative.xr.STATUS" />
             </intent-filter>

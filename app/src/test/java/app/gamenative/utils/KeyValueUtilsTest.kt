@@ -1054,4 +1054,36 @@ class KeyValueUtilsTest {
         assertEquals(PathType.WinMyDocuments, patterns[0].uploadRoot)
     }
 
+    @Test
+    fun steamLaunchArgumentsAreParsed() {
+        val kvString = """
+            "appinfo"
+            {
+                "appid" "12345"
+                "config"
+                {
+                    "launch"
+                    {
+                        "0"
+                        {
+                            "executable" "bin/game.exe"
+                            "workingdir" "bin"
+                            "arguments" "-vr -openxr"
+                            "description" "Launch in OpenXR"
+                            "config"
+                            {
+                                "oslist" "windows"
+                            }
+                        }
+                    }
+                }
+            }
+        """.trimIndent()
+
+        val steamApp = KeyValue.loadFromString(kvString)!!.generateSteamApp()
+
+        assertEquals(1, steamApp.config.launch.size)
+        assertEquals("-vr -openxr", steamApp.config.launch.single().arguments)
+    }
+
 }

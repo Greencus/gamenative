@@ -503,9 +503,7 @@ fun PluviaMain(
                                 selectedLaunchInfo?.executable.orEmpty(),
                                 launchContainer.executablePath,
                                 installedExecutable,
-                            ).ifBlank {
-                                launchContainer.executablePath.ifBlank { installedExecutable }
-                            }
+                            )
                         } else {
                             ""
                         }
@@ -1699,7 +1697,11 @@ fun preLaunchApp(
                                 installedExecutable,
                             )
                         }
-                        if (resolvedExecutable.isNotBlank() && resolvedExecutable != container.executablePath) {
+                        if (
+                            !shouldLaunchInXr &&
+                            resolvedExecutable.isNotBlank() &&
+                            resolvedExecutable != container.executablePath
+                        ) {
                             container.executablePath = resolvedExecutable
                             container.saveData()
                         }

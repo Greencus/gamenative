@@ -254,6 +254,7 @@ GN_IMPORT gn_ulong GN_STDCALL GetEnvironmentVariableA(const char* name, char* bu
 GN_IMPORT void GN_STDCALL OutputDebugStringA(const char* text);
 GN_IMPORT void* GN_STDCALL LoadLibraryA(const char* name);
 GN_IMPORT void* GN_STDCALL GetProcAddress(void* module, const char* name);
+GN_IMPORT unsigned long GN_STDCALL GetLastError(void);
 GN_IMPORT long GN_STDCALL CreateDXGIFactory(const void* iid, void** factory);
 
 typedef int gn_ntstatus;
@@ -634,6 +635,8 @@ static int gn_reference_space_event_pending = 0;
 static int gn_instance_loss_event_pending = 0;
 static GnSwapchain gn_swapchains[GN_MAX_SWAPCHAINS];
 static gn_uint32 gn_swapchain_count = 0;
+static gn_uint32 gn_transport_eye_mask = 0;
+static int gn_transport_failure_logged = 0;
 static gn_uint64 gn_unix_handle = 0;
 static int gn_unix_load_attempted = 0;
 typedef gn_ntstatus (GN_STDCALL *GnWineUnixCall)(gn_uint32 code, void* args);
@@ -681,29 +684,65 @@ static int gn_load_unixlib(void) {
     gn_unix_load_attempted = 1;
 
     /*
-     * Load a Wine builtin companion instead of querying the by-name loader
-     * directly. MemoryWineLoadUnixLibByName was added after the Wine 9.2
-     * runtime bundled by GameNative; the companion's __wine_init_unix_call()
-     * works with both the old module-associated ABI and current Wine.
+     * Current Wine can load a unixlib by name using the host architecture.
+     * Prefer that path when available. Older ARM64EC builds reject this
+     * private information class; they fall back below to the ARM64X builtin
+     * companion paired with the aarch64 Unix library.
      */
-    void* module = LoadLibraryA("gamenative_xr_unixbridge.dll");
-    if (!module) {
-        gn_log_line("Wine unix bridge module load failed");
-        return 0;
+    {
+        static gn_uint16 unixlib_name[] = {
+            'g','a','m','e','n','a','t','i','v','e','_','x','r','_',
+            'u','n','i','x','b','r','i','d','g','e','.','d','l','l',0
+        };
+        GnUnicodeString name;
+        gn_uint64 result[2] = {0, 0};
+        gn_size result_length = 0;
+        name.Length = (gn_uint16)(sizeof(unixlib_name) - sizeof(gn_uint16));
+        name.MaximumLength = (gn_uint16)sizeof(unixlib_name);
+        name.Buffer = unixlib_name;
+        /* Wine-private MEMORY_INFORMATION_CLASS values start at 1000:
+         * LoadUnixLib, LoadUnixLibWow64, LoadUnixLibByName. */
+        gn_ntstatus status = NtQueryVirtualMemory(
+            (void*)(gn_size)-1,
+            &name,
+            1002,
+            result,
+            sizeof(result),
+            &result_length);
+        if (status == 0 && result[1]) {
+            gn_unix_handle = result[1];
+            gn_log_line("Wine unixlib loaded directly by name");
+        } else {
+            gn_log_num("Wine direct unixlib load unavailable, status=", status);
+        }
     }
-    gn_wine_unix_call = (GnWineUnixCall)GetProcAddress(module, "gnWineUnixCall");
-    if (!gn_wine_unix_call) {
-        gn_log_line("Wine unix bridge entry point missing");
-        return 0;
+
+    if (!gn_unix_handle) {
+        /* Wine fallback: use a builtin PE companion associated with the
+         * matching aarch64/x86_64/i386 unixlib. */
+        void* module = LoadLibraryA("gamenative_xr_unixbridge.dll");
+        if (!module) {
+            gn_log_num("Wine unix bridge module load failed, error=", GetLastError());
+            return 0;
+        }
+        gn_wine_unix_call = (GnWineUnixCall)GetProcAddress(module, "gnWineUnixCall");
+        if (!gn_wine_unix_call) {
+            gn_log_line("Wine unix bridge entry point missing");
+            return 0;
+        }
+        gn_unix_handle = (gn_uint64)(gn_size)module;
     }
-    gn_unix_handle = (gn_uint64)(gn_size)module;
+
     {
         struct gn_unix_init_args args;
         args.abi_version = GN_UNIX_ABI_VERSION;
         args.result = GN_UNIX_ERROR_UNAVAILABLE;
-        gn_ntstatus status = gn_wine_unix_call(GN_UNIX_INIT, &args);
+        gn_ntstatus status = gn_wine_unix_call ?
+            gn_wine_unix_call(GN_UNIX_INIT, &args) :
+            __wine_unix_call_dispatcher(gn_unix_handle, GN_UNIX_INIT, &args);
         if (status != 0 || args.result != GN_UNIX_SUCCESS) {
             gn_log_num("Wine unixlib init failed status=", status);
+            gn_log_num("Wine unixlib init result=", args.result);
             gn_unix_handle = 0;
             gn_wine_unix_call = NULL;
             return 0;
@@ -715,7 +754,9 @@ static int gn_load_unixlib(void) {
 
 static int gn_unix_call(unsigned int code, void* args) {
     if (!gn_load_unixlib()) return 0;
-    gn_ntstatus status = gn_wine_unix_call(code, args);
+    gn_ntstatus status = gn_wine_unix_call ?
+        gn_wine_unix_call(code, args) :
+        __wine_unix_call_dispatcher(gn_unix_handle, code, args);
     if (status != 0) {
         gn_log_num("Wine unix call failed status=", status);
         return 0;
@@ -767,9 +808,15 @@ static int gn_set_vulkan_context(const XrGraphicsBindingVulkanKHR* binding) {
     args.queue_family_index = binding->queueFamilyIndex;
     args.queue_index = binding->queueIndex;
     args.handles_are_host = 0;
+    args.diagnostic_flags = 0;
     args.result = GN_UNIX_ERROR_UNAVAILABLE;
-    return gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) &&
-           args.result == GN_UNIX_SUCCESS;
+    if (!gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) ||
+        args.result != GN_UNIX_SUCCESS) {
+        gn_log_num("Wine Vulkan context result=", args.result);
+        gn_log_num("Wine Vulkan context flags=", args.diagnostic_flags);
+        return 0;
+    }
+    return 1;
 }
 
 typedef long (GN_STDCALL *GnComQueryInterface)(void*, const GnGuid*, void**);
@@ -866,10 +913,20 @@ static int gn_set_d3d11_context(ID3D11Device* device11) {
     args.client_queue = (gn_u64)gn_vk_queue;
     args.queue_family_index = queue_family;
     args.queue_index = queue_index;
-    args.handles_are_host = 1;
+    /* DXVK is a Windows Vulkan client. Its private interop interface exposes
+     * the Vk handles that DXVK uses through winevulkan, not host-loader
+     * handles that can be passed directly to libvulkan.so. The Unix companion
+     * must unwrap these client dispatchables before calling host Vulkan. */
+    args.handles_are_host = 0;
+    args.diagnostic_flags = 0;
     args.result = GN_UNIX_ERROR_UNAVAILABLE;
-    return gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) &&
-           args.result == GN_UNIX_SUCCESS;
+    if (!gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) ||
+        args.result != GN_UNIX_SUCCESS) {
+        gn_log_num("Wine DXVK Vulkan context result=", args.result);
+        gn_log_num("Wine DXVK Vulkan context flags=", args.diagnostic_flags);
+        return 0;
+    }
+    return 1;
 }
 
 static void gn_dxvk_flush_and_lock(void) {
@@ -938,10 +995,17 @@ static int gn_set_d3d12_context(
     args.client_queue = (gn_u64)gn_vk_queue;
     args.queue_family_index = queue_family;
     args.queue_index = queue_index;
-    args.handles_are_host = 1;
+    /* vkd3d-proton likewise exposes winevulkan client dispatchables. */
+    args.handles_are_host = 0;
+    args.diagnostic_flags = 0;
     args.result = GN_UNIX_ERROR_UNAVAILABLE;
-    return gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) &&
-           args.result == GN_UNIX_SUCCESS;
+    if (!gn_unix_call(GN_UNIX_SET_VULKAN_CONTEXT, &args) ||
+        args.result != GN_UNIX_SUCCESS) {
+        gn_log_num("Wine vkd3d Vulkan context result=", args.result);
+        gn_log_num("Wine vkd3d Vulkan context flags=", args.diagnostic_flags);
+        return 0;
+    }
+    return 1;
 }
 
 static void gn_vkd3d_lock(void) {
@@ -2038,6 +2102,71 @@ static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, Xr
     return XR_SUCCESS;
 }
 
+static XrResult XRAPI_CALL gn_xrLocateSpaces(
+    XrSession session,
+    const XrSpacesLocateInfo* locateInfo,
+    XrSpaceLocations* spaceLocations) {
+    if (session != gn_session) return XR_ERROR_HANDLE_INVALID;
+    if (!locateInfo || locateInfo->type != XR_TYPE_SPACES_LOCATE_INFO ||
+        !spaceLocations || spaceLocations->type != XR_TYPE_SPACE_LOCATIONS ||
+        locateInfo->spaceCount != spaceLocations->locationCount ||
+        (locateInfo->spaceCount && (!locateInfo->spaces || !spaceLocations->locations))) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    XrSpaceVelocities* space_velocities = NULL;
+    if (spaceLocations->next) {
+        typedef struct GnOutHeader {
+            XrStructureType type;
+            void* next;
+        } GnOutHeader;
+        GnOutHeader* next = (GnOutHeader*)spaceLocations->next;
+        while (next) {
+            if (next->type == XR_TYPE_SPACE_VELOCITIES) {
+                space_velocities = (XrSpaceVelocities*)next;
+                break;
+            }
+            next = (GnOutHeader*)next->next;
+        }
+    }
+    if (space_velocities &&
+        (space_velocities->velocityCount != locateInfo->spaceCount ||
+         (space_velocities->velocityCount && !space_velocities->velocities))) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    for (uint32_t i = 0; i < locateInfo->spaceCount; ++i) {
+        XrSpaceVelocity velocity = {
+            XR_TYPE_SPACE_VELOCITY,
+            NULL,
+            0,
+            {0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f},
+        };
+        XrSpaceLocation location = {
+            XR_TYPE_SPACE_LOCATION,
+            space_velocities ? &velocity : NULL,
+            0,
+            {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}},
+        };
+        XrResult result = gn_xrLocateSpace(
+            locateInfo->spaces[i],
+            locateInfo->baseSpace,
+            locateInfo->time,
+            &location);
+        if (XR_FAILED(result)) return result;
+
+        spaceLocations->locations[i].locationFlags = location.locationFlags;
+        spaceLocations->locations[i].pose = location.pose;
+        if (space_velocities) {
+            space_velocities->velocities[i].velocityFlags = velocity.velocityFlags;
+            space_velocities->velocities[i].linearVelocity = velocity.linearVelocity;
+            space_velocities->velocities[i].angularVelocity = velocity.angularVelocity;
+        }
+    }
+    return XR_SUCCESS;
+}
+
 /* ------------------------------------------------------------------ */
 /* Frame loop                                                          */
 /* ------------------------------------------------------------------ */
@@ -2188,8 +2317,17 @@ static XrResult XRAPI_CALL gn_xrEndFrame(XrSession session, const XrFrameEndInfo
             if (!gn_unix_call(GN_UNIX_SUBMIT_IMAGE, &args) ||
                 args.result != GN_UNIX_SUCCESS) {
                 submission_failed = 1;
+                if (!gn_transport_failure_logged) {
+                    gn_log_num("xrEndFrame image transport failed result=", args.result);
+                    gn_transport_failure_logged = 1;
+                }
             } else {
                 state->submitted[state->last_released_image] = 1;
+                gn_transport_eye_mask |= (1u << eye);
+                if (gn_transport_eye_mask == 3u) {
+                    gn_log_line("xrEndFrame image transport accepted both eyes");
+                    gn_transport_eye_mask |= 4u;
+                }
             }
         }
     }
@@ -3131,6 +3269,7 @@ GN_EXPORT XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance, const c
     GN_PROC(xrDestroySpace)
     GN_PROC(xrCreateActionSpace)
     GN_PROC(xrLocateSpace)
+    GN_PROC(xrLocateSpaces)
     GN_PROC(xrWaitFrame)
     GN_PROC(xrBeginFrame)
     GN_PROC(xrEndFrame)
@@ -3171,6 +3310,10 @@ GN_EXPORT XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance, const c
     GN_PROC(xrApplyHapticFeedback)
     GN_PROC(xrStopHapticFeedback)
 #undef GN_PROC
+    if (gn_streq(name, "xrLocateSpacesKHR")) {
+        *function = (PFN_xrVoidFunction)gn_xrLocateSpaces;
+        return XR_SUCCESS;
+    }
     if (gn_streq(name, "xrGetInstanceProcAddr")) {
         *function = (PFN_xrVoidFunction)xrGetInstanceProcAddr;
         return XR_SUCCESS;

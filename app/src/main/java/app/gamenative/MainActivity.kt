@@ -46,6 +46,7 @@ import app.gamenative.utils.IconDecoder
 import app.gamenative.utils.IntentLaunchManager
 import app.gamenative.utils.LocaleHelper
 import app.gamenative.ui.util.SnackbarManager
+import app.gamenative.xr.XrLaunchDiagnostics
 import com.posthog.PostHog
 import com.skydoves.landscapist.coil.LocalCoilImageLoader
 import com.winlator.core.AppUtils
@@ -294,7 +295,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         // emit before super so Compose DisposableEffects (which unregister
         // listeners during super.onDestroy's lifecycle transition) still fire
-        if (!isChangingConfigurations) {
+        if (GameHostLifecycle.shouldTearDownEnvironment(isChangingConfigurations, PluviaApp.isVrSessionActive)) {
             PluviaApp.events.emit(AndroidEvent.ActivityDestroyed)
 
             // if exit() didn't run (listener already unregistered, race, etc.)
@@ -303,6 +304,9 @@ class MainActivity : ComponentActivity() {
                 Timber.w("onDestroy: keepAlive still set after ActivityDestroyed — forcing cleanup")
                 PluviaApp.shutdownEnvironment()
             }
+        } else if (!isChangingConfigurations) {
+            Timber.i("onDestroy: preserving active GameNativeVR environment")
+            XrLaunchDiagnostics.record(this, "MainActivity destroyed while VR is active; Wine environment preserved")
         }
 
         super.onDestroy()
@@ -320,18 +324,20 @@ class MainActivity : ComponentActivity() {
             isChangingConfigurations,
         )
 
-        if (SteamService.isConnected && !SteamService.isLoggedIn && !isChangingConfigurations && !SteamService.keepAlive) {
+        if (SteamService.isConnected && !SteamService.isLoggedIn && !isChangingConfigurations &&
+            !SteamService.keepAlive && !PluviaApp.isVrSessionActive
+        ) {
             Timber.i("Stopping Steam Service")
             SteamService.stop()
         }
 
-        if (GOGService.isRunning && !isChangingConfigurations) {
+        if (GOGService.isRunning && !isChangingConfigurations && !PluviaApp.isVrSessionActive) {
             Timber.i("Stopping GOG Service")
             GOGService.stop()
         }
 
         // Stop EpicService when app is destroyed (unless config change)
-        if (EpicService.isRunning && !isChangingConfigurations) {
+        if (EpicService.isRunning && !isChangingConfigurations && !PluviaApp.isVrSessionActive) {
             Timber.i("Stopping EpicService - app destroyed")
             EpicService.stop()
         }
@@ -398,25 +404,31 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        PluviaApp.isActivityInForeground = false
-        if (hasReadyGameLifecycleState("pause")) {
-            when {
-                PluviaApp.isNeverSuspendMode() -> {
-                    Timber.d("Game pause skipped due to suspend policy=never")
-                }
-                else -> {
-                    PluviaApp.xEnvironment?.onPause()
-                    if (PluviaApp.isManualSuspendMode()) {
-                        PluviaApp.isOverlayPaused = true
-                        Timber.d("Game paused due to app backgrounded (manual resume required)")
-                    } else {
-                        Timber.d("Game paused due to app backgrounded")
+        val controlsGameHost =
+            GameHostLifecycle.shouldMainActivityControlGameHost(PluviaApp.isVrSessionActive)
+        if (controlsGameHost) {
+            PluviaApp.isActivityInForeground = false
+            if (hasReadyGameLifecycleState("pause")) {
+                when {
+                    PluviaApp.isNeverSuspendMode() -> {
+                        Timber.d("Game pause skipped due to suspend policy=never")
+                    }
+                    else -> {
+                        PluviaApp.xEnvironment?.onPause()
+                        if (PluviaApp.isManualSuspendMode()) {
+                            PluviaApp.isOverlayPaused = true
+                            Timber.d("Game paused due to app backgrounded (manual resume required)")
+                        } else {
+                            Timber.d("Game paused due to app backgrounded")
+                        }
                     }
                 }
             }
-        }
-        if (PrefManager.usageAnalyticsEnabled) {
-            PostHog.capture(event = "app_backgrounded")
+            if (PrefManager.usageAnalyticsEnabled) {
+                PostHog.capture(event = "app_backgrounded")
+            }
+        } else {
+            Timber.d("MainActivity pause ignored because GameNativeVR owns the game host")
         }
         super.onPause()
     }
@@ -426,8 +438,10 @@ class MainActivity : ComponentActivity() {
         super.onStop()
         orientationSensorListener?.disable()
         orientationSensorListener = null
-        // enable auto-stop behavior if backgrounded
-        SteamService.autoStopWhenIdle = true
+        // The library activity is backgrounded during a Quest launch, but the
+        // VR activity still needs the service and owns the active game host.
+        SteamService.autoStopWhenIdle =
+            GameHostLifecycle.shouldMainActivityControlGameHost(PluviaApp.isVrSessionActive)
 
         Timber.d(
             "onStop - Index: %d, Connected: %b, Logged-In: %b, Changing-Config: %b, Keep Alive: %b, Is Importing: %b",
@@ -440,6 +454,7 @@ class MainActivity : ComponentActivity() {
         )
         // stop SteamService only if no downloads or sync are in progress
         if (!isChangingConfigurations &&
+            !PluviaApp.isVrSessionActive &&
             SteamService.isConnected &&
             !SteamService.hasActiveOperations() &&
             !SteamService.isLoginInProgress &&
@@ -451,7 +466,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Stop GOGService if running and no downloads in progress
-        if (GOGService.isRunning && !isChangingConfigurations) {
+        if (GOGService.isRunning && !isChangingConfigurations && !PluviaApp.isVrSessionActive) {
             if(!GOGService.hasActiveOperations()) {
                 Timber.i("Stopping GOG Service - no active operations")
                 GOGService.stop()
@@ -459,7 +474,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Stop EpicService if running, unless there are active downloads or sync operations
-        if (EpicService.isRunning && !isChangingConfigurations) {
+        if (EpicService.isRunning && !isChangingConfigurations && !PluviaApp.isVrSessionActive) {
             if (!EpicService.hasActiveOperations()) {
                 Timber.i("Stopping EpicService - no active operations")
                 EpicService.stop()
