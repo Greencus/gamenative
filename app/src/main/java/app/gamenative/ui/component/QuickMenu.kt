@@ -88,6 +88,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import app.gamenative.PluviaApp
 import app.gamenative.PrefManager
 import app.gamenative.R
 import app.gamenative.ui.data.PerformanceHudConfig
@@ -95,6 +96,7 @@ import app.gamenative.ui.data.PerformanceHudSize
 import app.gamenative.ui.theme.PluviaTheme
 import app.gamenative.ui.util.adaptivePanelWidth
 import app.gamenative.utils.MathUtils.normalizedProgress
+import app.gamenative.xr.QuestVrMenuBridge
 import com.winlator.container.Container
 import com.winlator.renderer.GLRenderer
 import com.winlator.renderer.VulkanRenderer
@@ -801,6 +803,9 @@ fun QuickMenu(
     }
 
     LaunchedEffect(isVisible) {
+        if (PluviaApp.isVrSessionActive) {
+            QuestVrMenuBridge.publishVisibility(isVisible)
+        }
         if (isVisible) {
             repeat(3) {
                 try {

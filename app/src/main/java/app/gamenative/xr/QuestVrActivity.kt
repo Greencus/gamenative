@@ -4,8 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.SurfaceTexture
+import android.graphics.PorterDuff
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
 import android.view.Surface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -56,9 +61,25 @@ class QuestVrActivity : ComponentActivity() {
     @Volatile private var nativeXrHandle: Long = 0
     private var xrSurfaceTexture: SurfaceTexture? = null
     private var xrRenderSurface: Surface? = null
+    @Volatile private var vrMenuSurfaceTexture: SurfaceTexture? = null
+    @Volatile private var vrMenuRenderSurface: Surface? = null
     private val bridgeServer = XrBridgeServer()
     @Volatile private var pendingBridgeMilestone: String? = null
     @Volatile private var launchFailurePending: Boolean = false
+    @Volatile private var vrQuickMenuVisible: Boolean = false
+    @Volatile private var vrQuickMenuToggle: (() -> Unit)? = null
+    private val lastVrButtons = IntArray(2)
+    private val neutralVrMenuInput = Array(2) { FloatArray(18) }
+    private var lastVrMenuDirection = 0
+    private var nextVrMenuRepeatAtMs = 0L
+    private var lastVrMenuTriggerPressed = false
+    private val vrMenuCaptureRunnable = object : Runnable {
+        override fun run() {
+            if (!vrQuickMenuVisible) return
+            captureVrMenuFrame()
+            window.decorView.postDelayed(this, VR_MENU_CAPTURE_INTERVAL_MS)
+        }
+    }
     private var xrContainerSettings = XrContainerSettings.Values()
 
     override fun attachBaseContext(newBase: Context) {
@@ -172,6 +193,17 @@ class QuestVrActivity : ComponentActivity() {
             pendingBridgeMilestone = event
             XrLaunchDiagnostics.record(this, event)
         }
+        QuestVrMenuBridge.setVisibilityListener { visible ->
+            vrQuickMenuVisible = visible
+            if (visible) {
+                startVrMenuCapture()
+            } else {
+                stopVrMenuCapture()
+                resetVrMenuNavigation()
+            }
+            val handle = nativeXrHandle
+            if (handle != 0L) nativeSetMenuVisible(handle, visible)
+        }
         bridgeServer.start()
         var startupError: String? = null
         nativeXrHandle = runCatching {
@@ -241,7 +273,7 @@ class QuestVrActivity : ComponentActivity() {
                             testGraphics = testGraphics,
                             isOffline = isOffline,
                             launchInfoOverride = launchInfoOverride,
-                            registerBackAction = {},
+                            registerBackAction = { action -> vrQuickMenuToggle = action },
                             navigateBack = {
                                 XrLaunchDiagnostics.record(this, "VR screen requested navigation back")
                                 if (!launchFailurePending) finish()
@@ -295,6 +327,8 @@ class QuestVrActivity : ComponentActivity() {
         bridgeServer.onHaptic = null
         bridgeServer.onRequestExit = null
         bridgeServer.onDiagnosticEvent = null
+        QuestVrMenuBridge.setVisibilityListener(null)
+        vrQuickMenuToggle = null
         if (nativeXrHandle != 0L) {
             nativeStop(nativeXrHandle)
             nativeXrHandle = 0
@@ -302,6 +336,7 @@ class QuestVrActivity : ComponentActivity() {
         bridgeServer.stop()
         QuestVrSurfaceRegistry.clearSurface()
         releaseXrRenderSurface()
+        releaseVrMenuSurface()
         if (!isChangingConfigurations) {
             PluviaApp.events.emit(AndroidEvent.ActivityDestroyed)
             PluviaApp.isVrSessionActive = false
@@ -344,7 +379,108 @@ class QuestVrActivity : ComponentActivity() {
 
     @Suppress("unused")
     private fun onNativeXrInput(hand: Int, buttons: Int, active: Boolean, data: FloatArray) {
-        bridgeServer.updateInput(hand = hand, buttons = buttons, active = active, data = data)
+        if (hand !in 0..1) return
+
+        val previousButtons = lastVrButtons[hand]
+        lastVrButtons[hand] = buttons
+        if (hand == 0 && buttons and VR_BUTTON_MENU != 0 && previousButtons and VR_BUTTON_MENU == 0) {
+            runOnUiThread { vrQuickMenuToggle?.invoke() }
+        }
+
+        if (vrQuickMenuVisible) {
+            if (hand == 1) handleVrMenuNavigation(buttons, previousButtons, data)
+            val neutral = neutralVrMenuInput[hand]
+            // Keep pose tracking continuous while withholding menu navigation,
+            // trigger and stick input from the Windows game.
+            if (data.size > 4) {
+                data.copyInto(
+                    destination = neutral,
+                    destinationOffset = 4,
+                    startIndex = 4,
+                    endIndex = minOf(neutral.size, data.size),
+                )
+            }
+            neutral.fill(0.0f, fromIndex = 0, toIndex = 4)
+            bridgeServer.updateInput(hand = hand, buttons = 0, active = active, data = neutral)
+        } else {
+            // Reserve the left menu button for the host-side VR quick menu.
+            bridgeServer.updateInput(
+                hand = hand,
+                buttons = buttons and VR_BUTTON_MENU.inv(),
+                active = active,
+                data = data,
+            )
+        }
+    }
+
+    private fun handleVrMenuNavigation(buttons: Int, previousButtons: Int, data: FloatArray) {
+        val primaryPressed = buttons and VR_BUTTON_PRIMARY != 0
+        val primaryWasPressed = previousButtons and VR_BUTTON_PRIMARY != 0
+        val secondaryPressed = buttons and VR_BUTTON_SECONDARY != 0
+        val secondaryWasPressed = previousButtons and VR_BUTTON_SECONDARY != 0
+        val triggerPressed = data.getOrElse(0) { 0.0f } >= VR_MENU_TRIGGER_THRESHOLD
+
+        if ((primaryPressed && !primaryWasPressed) ||
+            (triggerPressed && !lastVrMenuTriggerPressed)
+        ) {
+            dispatchVrMenuKey(KeyEvent.KEYCODE_BUTTON_A)
+        }
+        if (secondaryPressed && !secondaryWasPressed) {
+            runOnUiThread { vrQuickMenuToggle?.invoke() }
+        }
+        lastVrMenuTriggerPressed = triggerPressed
+
+        val stickX = data.getOrElse(2) { 0.0f }
+        val stickY = data.getOrElse(3) { 0.0f }
+        val direction = when {
+            stickY >= VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_UP
+            stickY <= -VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_DOWN
+            stickX <= -VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_LEFT
+            stickX >= VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_RIGHT
+            else -> 0
+        }
+        val now = SystemClock.uptimeMillis()
+        when {
+            direction == 0 -> {
+                lastVrMenuDirection = 0
+                nextVrMenuRepeatAtMs = 0L
+            }
+            direction != lastVrMenuDirection -> {
+                dispatchVrMenuKey(direction)
+                lastVrMenuDirection = direction
+                nextVrMenuRepeatAtMs = now + VR_MENU_INITIAL_REPEAT_DELAY_MS
+            }
+            now >= nextVrMenuRepeatAtMs -> {
+                dispatchVrMenuKey(direction)
+                nextVrMenuRepeatAtMs = now + VR_MENU_REPEAT_INTERVAL_MS
+            }
+        }
+    }
+
+    private fun dispatchVrMenuKey(keyCode: Int) {
+        runOnUiThread {
+            val eventTime = SystemClock.uptimeMillis()
+            val down = KeyEvent(
+                eventTime,
+                eventTime,
+                KeyEvent.ACTION_DOWN,
+                keyCode,
+                0,
+                0,
+                KeyCharacterMap.VIRTUAL_KEYBOARD,
+                0,
+                0,
+                InputDevice.SOURCE_GAMEPAD,
+            )
+            dispatchKeyEvent(down)
+            dispatchKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP))
+        }
+    }
+
+    private fun resetVrMenuNavigation() {
+        lastVrMenuDirection = 0
+        nextVrMenuRepeatAtMs = 0L
+        lastVrMenuTriggerPressed = false
     }
 
     @Suppress("unused")
@@ -385,6 +521,75 @@ class QuestVrActivity : ComponentActivity() {
         }.onFailure { error ->
             Timber.e(error, "Failed to create GameNativeVR SurfaceTexture")
         }.getOrNull()
+    }
+
+    @Suppress("unused")
+    private fun createNativeVrMenuSurfaceTexture(textureId: Int, width: Int, height: Int): SurfaceTexture? {
+        Timber.i("Creating GameNativeVR menu SurfaceTexture: texture=$textureId ${width}x$height")
+        // This callback runs on the native XR thread. Do not stop the UI-thread
+        // capture runnable here: it was deliberately started just before native
+        // resource creation and will publish the first frame on its next tick.
+        vrMenuRenderSurface?.release()
+        vrMenuSurfaceTexture?.release()
+        return runCatching {
+            SurfaceTexture(textureId).also { texture ->
+                texture.setDefaultBufferSize(width, height)
+                vrMenuSurfaceTexture = texture
+                vrMenuRenderSurface = Surface(texture)
+            }
+        }.onFailure { error ->
+            Timber.e(error, "Failed to create GameNativeVR menu SurfaceTexture")
+        }.getOrNull()
+    }
+
+    private fun startVrMenuCapture() {
+        val decor = window.decorView
+        decor.removeCallbacks(vrMenuCaptureRunnable)
+        captureVrMenuFrame()
+        decor.postDelayed(vrMenuCaptureRunnable, VR_MENU_CAPTURE_INTERVAL_MS)
+    }
+
+    private fun stopVrMenuCapture() {
+        window.decorView.removeCallbacks(vrMenuCaptureRunnable)
+    }
+
+    private fun captureVrMenuFrame() {
+        val surface = vrMenuRenderSurface ?: return
+        val decor = window.decorView
+        if (!surface.isValid || decor.width <= 0 || decor.height <= 0) return
+
+        var canvas: android.graphics.Canvas? = null
+        try {
+            canvas = surface.lockHardwareCanvas()
+            canvas.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            val saveCount = canvas.save()
+            canvas.scale(
+                VR_MENU_SURFACE_WIDTH.toFloat() / decor.width.toFloat(),
+                VR_MENU_SURFACE_HEIGHT.toFloat() / decor.height.toFloat(),
+            )
+            decor.draw(canvas)
+            canvas.restoreToCount(saveCount)
+        } catch (error: Exception) {
+            Timber.w(error, "Could not capture VR quick menu frame")
+        } finally {
+            if (canvas != null) {
+                runCatching { surface.unlockCanvasAndPost(canvas) }
+                    .onFailure { error -> Timber.w(error, "Could not publish VR quick menu frame") }
+            }
+        }
+    }
+
+    private fun releaseVrMenuSurface() {
+        stopVrMenuCapture()
+        releaseNativeVrMenuSurface()
+    }
+
+    @Suppress("unused")
+    private fun releaseNativeVrMenuSurface() {
+        vrMenuRenderSurface?.release()
+        vrMenuRenderSurface = null
+        vrMenuSurfaceTexture?.release()
+        vrMenuSurfaceTexture = null
     }
 
     private fun releaseXrRenderSurface() {
@@ -501,6 +706,17 @@ class QuestVrActivity : ComponentActivity() {
     }
 
     companion object {
+        private const val VR_BUTTON_PRIMARY = 1
+        private const val VR_BUTTON_SECONDARY = 2
+        private const val VR_BUTTON_MENU = 8
+        private const val VR_MENU_TRIGGER_THRESHOLD = 0.72f
+        private const val VR_MENU_STICK_THRESHOLD = 0.55f
+        private const val VR_MENU_INITIAL_REPEAT_DELAY_MS = 360L
+        private const val VR_MENU_REPEAT_INTERVAL_MS = 110L
+        private const val VR_MENU_CAPTURE_INTERVAL_MS = 33L
+        private const val VR_MENU_SURFACE_WIDTH = 1920
+        private const val VR_MENU_SURFACE_HEIGHT = 1080
+
         init {
             if (Build.BRAND.equals("oculus", ignoreCase = true)) {
                 try {
@@ -521,6 +737,7 @@ class QuestVrActivity : ComponentActivity() {
     private external fun nativeStop(handle: Long)
     private external fun nativeHaptic(handle: Long, hand: Int, amplitude: Float, durationNs: Long, frequency: Float)
     private external fun nativeRequestExit(handle: Long)
+    private external fun nativeSetMenuVisible(handle: Long, visible: Boolean)
 }
 
 private fun android.content.Intent.toLaunchInfoOverride(): LaunchInfo? {

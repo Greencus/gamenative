@@ -158,11 +158,16 @@ public:
         exitRequested.store(true);
     }
 
+    void setMenuVisible(bool visible) {
+        menuVisible.store(visible, std::memory_order_release);
+    }
+
 private:
     JavaVM* javaVm{nullptr};
     jobject activityRef{nullptr};
     std::atomic<bool> running{false};
     std::atomic<bool> exitRequested{false};
+    std::atomic<bool> menuVisible{false};
     std::thread renderThread;
     int renderScalePercent{100};
     bool theaterScreenEnabled{true};
@@ -174,12 +179,15 @@ private:
     EGLSurface eglSurface{EGL_NO_SURFACE};
     GLuint framebuffer{0};
     GLuint externalTexture{0};
+    GLuint menuExternalTexture{0};
     GLuint blitProgram{0};
     GLuint blitVbo{0};
     GLuint blitVao{0};
     GLint blitTextureUniform{-1};
     jobject surfaceTextureRef{nullptr};
     jmethodID surfaceTextureUpdateTexImage{nullptr};
+    jobject menuSurfaceTextureRef{nullptr};
+    jmethodID menuSurfaceTextureUpdateTexImage{nullptr};
     jmethodID activityFrameStateMethod{nullptr};
     jmethodID activityInputMethod{nullptr};
     jmethodID activityViewConfigMethod{nullptr};
@@ -192,6 +200,7 @@ private:
     XrSystemId systemId{XR_NULL_SYSTEM_ID};
     XrSession session{XR_NULL_HANDLE};
     XrSpace appSpace{XR_NULL_HANDLE};
+    XrSpace viewSpace{XR_NULL_HANDLE};
     XrSessionState sessionState{XR_SESSION_STATE_UNKNOWN};
     bool sessionRunning{false};
     bool usingStageSpace{false};
@@ -241,6 +250,8 @@ private:
     GLuint overlayVbo{0};
     GLint overlayColorUniform{-1};
     bool overlayReady{false};
+    bool lastMenuVisible{false};
+    bool menuScreenReady{false};
     int64_t renderedClockMinute{-1};
     GLuint eyeTextures[gamenative::xr::FrameTransport::kEyeCount]
                       [gamenative::xr::FrameTransport::kMaxImages]{};
@@ -641,6 +652,16 @@ private:
             : XR_REFERENCE_SPACE_TYPE_LOCAL;
         spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
         XR_CHECK(xrCreateReferenceSpace(session, &spaceInfo, &appSpace));
+
+        // The runtime menu is head-facing so it remains reachable regardless of
+        // where the user was looking when the game established its stage origin.
+        XrReferenceSpaceCreateInfo viewSpaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        viewSpaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+        if (XR_FAILED(xrCreateReferenceSpace(session, &viewSpaceInfo, &viewSpace))) {
+            viewSpace = XR_NULL_HANDLE;
+            LOGW("VIEW reference space unavailable; VR menu will use app space");
+        }
         if (usingStageSpace) {
             XrExtent2Df bounds{};
             if (XR_SUCCEEDED(xrGetReferenceSpaceBoundsRect(
@@ -878,6 +899,21 @@ private:
     }
 
     bool createScreenSwapchain(JNIEnv* env) {
+        if (!createScreenSwapchainImages()) return false;
+        if (externalTexture == 0 && !createExternalTextureSurface(env)) {
+            destroyScreenSwapchain();
+            return false;
+        }
+        if (blitProgram == 0 && !createBlitResources()) {
+            destroyScreenSwapchain();
+            return false;
+        }
+        LOGI("OpenXR SurfaceTexture screen path ready");
+        return true;
+    }
+
+    bool createScreenSwapchainImages() {
+        if (screenSwapchain.swapchain != XR_NULL_HANDLE) return true;
         uint32_t formatCount = 0;
         XR_CHECK(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr));
         if (formatCount == 0) {
@@ -915,14 +951,107 @@ private:
             imageCount,
             &imageCount,
             reinterpret_cast<XrSwapchainImageBaseHeader*>(screenSwapchain.images.data())));
+        return true;
+    }
 
-        if (!createExternalTextureSurface(env)) {
+    void destroyScreenSwapchain() {
+        if (screenSwapchain.swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(screenSwapchain.swapchain);
+            screenSwapchain.swapchain = XR_NULL_HANDLE;
+        }
+        screenSwapchain.images.clear();
+    }
+
+    bool ensureMenuScreenResources(JNIEnv* env) {
+        if (!createScreenSwapchainImages()) return false;
+        if (menuSurfaceTextureRef == nullptr && !createMenuExternalTextureSurface(env)) {
+            destroyMenuExternalTextureSurface(env, false);
+            if (!theaterScreenEnabled) destroyScreenSwapchain();
             return false;
         }
-        if (!createBlitResources()) {
+        if (blitProgram == 0 && !createBlitResources()) {
+            if (!theaterScreenEnabled) destroyScreenSwapchain();
             return false;
         }
-        LOGI("OpenXR SurfaceTexture screen path ready");
+        return true;
+    }
+
+    void destroyMenuExternalTextureSurface(JNIEnv* env, bool notifyActivity) {
+        if (notifyActivity && env != nullptr) {
+            jclass activityClass = env->GetObjectClass(activityRef);
+            if (activityClass != nullptr) {
+                jmethodID method = env->GetMethodID(
+                    activityClass, "releaseNativeVrMenuSurface", "()V");
+                env->DeleteLocalRef(activityClass);
+                if (method != nullptr) {
+                    env->CallVoidMethod(activityRef, method);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                } else if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+            }
+        }
+        if (menuSurfaceTextureRef != nullptr && env != nullptr) {
+            env->DeleteGlobalRef(menuSurfaceTextureRef);
+            menuSurfaceTextureRef = nullptr;
+        }
+        menuSurfaceTextureUpdateTexImage = nullptr;
+        if (menuExternalTexture != 0) {
+            glDeleteTextures(1, &menuExternalTexture);
+            menuExternalTexture = 0;
+        }
+    }
+
+    bool createMenuExternalTextureSurface(JNIEnv* env) {
+        glGenTextures(1, &menuExternalTexture);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, menuExternalTexture);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+        jclass activityClass = env->GetObjectClass(activityRef);
+        if (activityClass == nullptr) return false;
+        jmethodID method = env->GetMethodID(
+            activityClass,
+            "createNativeVrMenuSurfaceTexture",
+            "(III)Landroid/graphics/SurfaceTexture;");
+        env->DeleteLocalRef(activityClass);
+        if (method == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            LOGE("QuestVrActivity.createNativeVrMenuSurfaceTexture not found");
+            return false;
+        }
+
+        jobject surfaceTexture = env->CallObjectMethod(
+            activityRef,
+            method,
+            static_cast<jint>(menuExternalTexture),
+            screenSwapchain.width,
+            screenSwapchain.height);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            LOGE("QuestVrActivity.createNativeVrMenuSurfaceTexture threw");
+            return false;
+        }
+        if (surfaceTexture == nullptr) {
+            LOGE("QuestVrActivity returned null menu SurfaceTexture");
+            return false;
+        }
+
+        menuSurfaceTextureRef = env->NewGlobalRef(surfaceTexture);
+        env->DeleteLocalRef(surfaceTexture);
+        jclass textureClass = env->GetObjectClass(menuSurfaceTextureRef);
+        menuSurfaceTextureUpdateTexImage =
+            env->GetMethodID(textureClass, "updateTexImage", "()V");
+        env->DeleteLocalRef(textureClass);
+        if (menuSurfaceTextureUpdateTexImage == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            LOGE("Menu SurfaceTexture.updateTexImage not found");
+            return false;
+        }
         return true;
     }
 
@@ -2004,6 +2133,20 @@ void main() {
         return viewCount;
     }
 
+    void configureScreenQuad(XrCompositionLayerQuad& layer, bool headFacing) {
+        layer.space = headFacing && viewSpace != XR_NULL_HANDLE ? viewSpace : appSpace;
+        layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        layer.subImage.swapchain = screenSwapchain.swapchain;
+        layer.subImage.imageRect.offset = {0, 0};
+        layer.subImage.imageRect.extent = {screenSwapchain.width, screenSwapchain.height};
+        layer.pose.orientation.w = 1.0f;
+        layer.pose.position.x = 0.0f;
+        layer.pose.position.y = headFacing ? 0.0f : (usingStageSpace ? 1.35f : 0.0f);
+        layer.pose.position.z = headFacing ? -1.75f : -2.2f;
+        layer.size.width = headFacing ? 2.2f : 2.6f;
+        layer.size.height = layer.size.width * 9.0f / 16.0f;
+    }
+
     void renderFrame(JNIEnv* env) {
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
@@ -2017,10 +2160,11 @@ void main() {
             frameState.predictedDisplayTime, viewsValid);
 
         XrCompositionLayerQuad quadLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad clockLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* submittedLayer = nullptr;
-        std::array<const XrCompositionLayerBaseHeader*, 2> submittedLayers{};
+        std::array<const XrCompositionLayerBaseHeader*, 3> submittedLayers{};
         uint32_t submittedLayerCount = 0;
 
         syncInput(frameState.predictedDisplayTime);
@@ -2028,6 +2172,25 @@ void main() {
         // Windows side wakes on this callback, so this ordering avoids returning the
         // previous headset frame's input to the game.
         publishFrameState(frameState, viewCount);
+
+        const bool showMenu = menuVisible.load(std::memory_order_acquire);
+        if (showMenu != lastMenuVisible) {
+            if (showMenu) {
+                menuScreenReady = ensureMenuScreenResources(env);
+                if (menuScreenReady) {
+                    LOGI("VR quick menu panel activated");
+                } else {
+                    LOGE("VR quick menu panel resources unavailable");
+                }
+            } else {
+                menuScreenReady = false;
+                if (!theaterScreenEnabled) destroyScreenSwapchain();
+                destroyMenuExternalTextureSurface(env, true);
+                LOGI("VR quick menu panel deactivated");
+            }
+            lastMenuVisible = showMenu;
+        }
+        const bool showFlatMenu = showMenu && menuScreenReady;
 
         const bool stereoRendered = frameState.shouldRender && viewsValid &&
             renderStereoProjection(viewCount, projectionLayer, submittedLayer);
@@ -2039,20 +2202,10 @@ void main() {
                     stereoMilestonePublished = true;
                 }
             }
-        } else if (frameState.shouldRender && theaterScreenEnabled &&
+        } else if (frameState.shouldRender && (theaterScreenEnabled || showFlatMenu) &&
                    screenSwapchain.swapchain != XR_NULL_HANDLE) {
-            renderScreenTexture();
-            quadLayer.space = appSpace;
-            quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quadLayer.subImage.swapchain = screenSwapchain.swapchain;
-            quadLayer.subImage.imageRect.offset = {0, 0};
-            quadLayer.subImage.imageRect.extent = {screenSwapchain.width, screenSwapchain.height};
-            quadLayer.pose.orientation.w = 1.0f;
-            quadLayer.pose.position.x = 0.0f;
-            quadLayer.pose.position.y = usingStageSpace ? 1.35f : 0.0f;
-            quadLayer.pose.position.z = -2.2f;
-            quadLayer.size.width = 2.6f;
-            quadLayer.size.height = 2.6f * 9.0f / 16.0f;
+            renderScreenTexture(showFlatMenu);
+            configureScreenQuad(quadLayer, showFlatMenu);
             submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
         } else if (frameState.shouldRender && theaterScreenEnabled && viewsValid &&
                    !eyeSwapchains.empty()) {
@@ -2079,6 +2232,12 @@ void main() {
         }
 
         if (submittedLayer != nullptr) submittedLayers[submittedLayerCount++] = submittedLayer;
+        if (frameState.shouldRender && stereoRendered && showFlatMenu) {
+            renderScreenTexture(true);
+            configureScreenQuad(menuLayer, true);
+            submittedLayers[submittedLayerCount++] =
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menuLayer);
+        }
         if (frameState.shouldRender &&
             renderActivityOverlay(viewsValid, viewCount, clockLayer)) {
             submittedLayers[submittedLayerCount++] =
@@ -2141,8 +2300,14 @@ void main() {
         }
     }
 
-    void renderScreenTexture() {
-        if (surfaceTextureRef == nullptr || surfaceTextureUpdateTexImage == nullptr || blitProgram == 0) {
+    void renderScreenTexture(bool useMenuTexture = false) {
+        jobject textureRef = useMenuTexture ? menuSurfaceTextureRef : surfaceTextureRef;
+        jmethodID updateTexImage = useMenuTexture
+            ? menuSurfaceTextureUpdateTexImage
+            : surfaceTextureUpdateTexImage;
+        const GLuint sourceTexture = useMenuTexture ? menuExternalTexture : externalTexture;
+        if (textureRef == nullptr || updateTexImage == nullptr ||
+            sourceTexture == 0 || blitProgram == 0) {
             return;
         }
 
@@ -2150,7 +2315,7 @@ void main() {
         if (javaVm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || env == nullptr) {
             return;
         }
-        env->CallVoidMethod(surfaceTextureRef, surfaceTextureUpdateTexImage);
+        env->CallVoidMethod(textureRef, updateTexImage);
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
             return;
@@ -2177,7 +2342,7 @@ void main() {
         glDisable(GL_BLEND);
         glUseProgram(blitProgram);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, sourceTexture);
         glBindVertexArray(blitVao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glBindVertexArray(0);
@@ -2257,11 +2422,8 @@ void main() {
             surfaceTextureRef = nullptr;
             surfaceTextureUpdateTexImage = nullptr;
         }
-        if (screenSwapchain.swapchain != XR_NULL_HANDLE) {
-            xrDestroySwapchain(screenSwapchain.swapchain);
-            screenSwapchain.swapchain = XR_NULL_HANDLE;
-        }
-        screenSwapchain.images.clear();
+        destroyMenuExternalTextureSurface(env, false);
+        destroyScreenSwapchain();
         for (auto& swapchain : eyeSwapchains) {
             if (swapchain.swapchain != XR_NULL_HANDLE) {
                 xrDestroySwapchain(swapchain.swapchain);
@@ -2298,6 +2460,10 @@ void main() {
                 env->DeleteGlobalRef(inputArrayRef);
                 inputArrayRef = nullptr;
             }
+        }
+        if (viewSpace != XR_NULL_HANDLE) {
+            xrDestroySpace(viewSpace);
+            viewSpace = XR_NULL_HANDLE;
         }
         if (appSpace != XR_NULL_HANDLE) {
             xrDestroySpace(appSpace);
@@ -2430,5 +2596,14 @@ Java_app_gamenative_xr_QuestVrActivity_nativeRequestExit(
     auto* app = reinterpret_cast<QuestXrApp*>(handle);
     if (app != nullptr) {
         app->requestExit();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_app_gamenative_xr_QuestVrActivity_nativeSetMenuVisible(
+    JNIEnv*, jobject, jlong handle, jboolean visible) {
+    auto* app = reinterpret_cast<QuestXrApp*>(handle);
+    if (app != nullptr) {
+        app->setMenuVisible(visible == JNI_TRUE);
     }
 }
