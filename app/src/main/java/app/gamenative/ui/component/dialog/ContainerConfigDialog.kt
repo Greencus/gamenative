@@ -308,7 +308,7 @@ fun ContainerConfigDialog(
             }
         }
 
-        val configState = rememberSaveable(stateSaver = ContainerData.Saver) {
+        val configState = rememberSaveable(initialConfig, stateSaver = ContainerData.Saver) {
             mutableStateOf(initialConfig)
         }
         var config by configState
@@ -679,7 +679,9 @@ fun ContainerConfigDialog(
 
         // Bionic-specific state
         val bionicDriverIndexRef = rememberSaveable {
-            val idx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == config.graphicsDriver }
+            val idx = bionicGraphicsDriversMerged.indexOfFirst {
+                StringUtils.parseIdentifier(it).equals(config.graphicsDriver, ignoreCase = true)
+            }
             mutableIntStateOf(if (idx >= 0) idx else 0)
         }
         var bionicDriverIndex by bionicDriverIndexRef
@@ -765,7 +767,9 @@ fun ContainerConfigDialog(
         }
 
         LaunchedEffect(bionicGraphicsDriversMerged, config.graphicsDriver) {
-            val newIdx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == config.graphicsDriver }
+            val newIdx = bionicGraphicsDriversMerged.indexOfFirst {
+                StringUtils.parseIdentifier(it).equals(config.graphicsDriver, ignoreCase = true)
+            }
             if (newIdx >= 0 && bionicDriverIndex != newIdx) bionicDriverIndex = newIdx
         }
 
@@ -1259,10 +1263,11 @@ fun ContainerConfigDialog(
                             actions = {
                                 IconButton(
                                     onClick = {
-                                        // Commit the dedicated XR preference store before the
-                                        // general container writer can close the editor or launch.
-                                        onVrConfigChanged(config)
+                                        // Persist the complete container first. VR settings are
+                                        // also part of that transaction; the separate callback is
+                                        // retained as a compatibility mirror for older callers.
                                         onSave(config)
+                                        onVrConfigChanged(config)
                                     },
                                     content = { Icon(Icons.Default.Save, null) },
                                 )

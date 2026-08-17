@@ -26,9 +26,15 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
 public class ContainerManager {
+    private static final ExecutorService FILE_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "container-files");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final ArrayList<Container> containers = new ArrayList<>();
     private final File homeDir;
     private final Context context;
@@ -87,13 +93,13 @@ public class ContainerManager {
 
     public void createContainerAsync(String containerId, final JSONObject data, Callback<Container> callback) {
         final Handler handler = new Handler();
-        Executors.newSingleThreadExecutor().execute(() -> {
+        FILE_EXECUTOR.execute(() -> {
             final Container container = createContainer(containerId, data);
             handler.post(() -> callback.call(container));
         });
     }
     public Future<Container> createContainerFuture(String containerId, final JSONObject data) {
-        return Executors.newSingleThreadExecutor().submit(() -> createContainer(containerId, data));
+        return FILE_EXECUTOR.submit(() -> createContainer(containerId, data));
     }
     public Future<Container> createDefaultContainerFuture(WineInfo wineInfo, String containerId) {
         String name = "container_" + containerId;
@@ -144,7 +150,7 @@ public class ContainerManager {
 
     public void duplicateContainerAsync(Container container, Runnable callback) {
         final Handler handler = new Handler();
-        Executors.newSingleThreadExecutor().execute(() -> {
+        FILE_EXECUTOR.execute(() -> {
             duplicateContainer(container);
             handler.post(callback);
         });
@@ -152,7 +158,7 @@ public class ContainerManager {
 
     public void removeContainerAsync(Container container, Runnable callback) {
         final Handler handler = new Handler();
-        Executors.newSingleThreadExecutor().execute(() -> {
+        FILE_EXECUTOR.execute(() -> {
             removeContainer(container);
             handler.post(callback);
         });

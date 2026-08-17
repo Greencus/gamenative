@@ -1,6 +1,7 @@
 package app.gamenative.xr
 
 import android.content.Context
+import app.gamenative.utils.ContainerUtils
 import app.gamenative.BuildConfig
 import app.gamenative.MainActivity
 import com.winlator.container.Container
@@ -40,7 +41,10 @@ object XrRuntimeManager {
     fun isOpenCompositeEnabled(context: Context, container: Container): Boolean =
         XrContainerSettings.read(context, container.id, container).openCompositeEnabled
 
-    fun setOpenCompositeEnabled(context: Context, container: Container, enabled: Boolean) {
+    fun setOpenCompositeEnabled(context: Context, appId: String, enabled: Boolean) {
+        // Reload before saveData(): callers commonly hold a screen-lifetime Container snapshot,
+        // while the container editor saves through a newer instance.
+        val container = ContainerUtils.getContainer(context, appId)
         val updated = XrContainerSettings.read(context, container.id, container).copy(
             openCompositeEnabled = enabled,
         )
@@ -145,11 +149,15 @@ object XrRuntimeManager {
 
     internal fun runtimeDllOverrides(existing: String): String {
         val xrOverride = "$UNIX_BRIDGE_MODULE=b"
+        // Steam's desktop overlay injects a renderer into every D3D process.
+        // It is not visible inside the Quest projection layer and only adds
+        // hooks, memory and frame-time variance to VR games.
+        val disabledDesktopOverlay = "gameoverlayrenderer=n;gameoverlayrenderer64=n"
         val withoutTrailingSeparators = existing.trim().trimEnd(';')
         return if (withoutTrailingSeparators.isEmpty()) {
-            xrOverride
+            "$disabledDesktopOverlay;$xrOverride"
         } else {
-            "$withoutTrailingSeparators;$xrOverride"
+            "$withoutTrailingSeparators;$disabledDesktopOverlay;$xrOverride"
         }
     }
 

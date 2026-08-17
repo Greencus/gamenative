@@ -16,13 +16,20 @@ import com.winlator.xserver.Drawable;
 import com.winlator.xserver.XServer;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 @SuppressLint("ViewConstructor")
 public class XServerView extends SurfaceView implements SurfaceHolder.Callback, XServerRendererView {
     private XServerRenderer renderer;
     private final XServer xServer;
-    private final ExecutorService eventExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService eventExecutor = new ThreadPoolExecutor(
+            0, 1, 5, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                Thread thread = new Thread(r, "xserver-render-events");
+                thread.setDaemon(true);
+                return thread;
+            });
     private int frameRateLimit = 0;
 
     public XServerView(Context context, XServer xServer, String selectedRenderer) {

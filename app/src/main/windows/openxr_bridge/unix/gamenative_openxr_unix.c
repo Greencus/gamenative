@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GN_FOURCC(a, b, c, d) \
@@ -41,6 +42,7 @@ struct gn_transport_image {
     void *hardware_buffer;
     uint8_t registered;
     uint8_t initialized;
+    uint8_t steady_recorded;
 };
 
 struct wine_client_object {
@@ -843,10 +845,16 @@ fail:
     return 0;
 }
 
-static int submit_ahardwarebuffer_copy(
+static int record_ahardwarebuffer_copy(
     const struct gn_swapchain *swapchain, const struct gn_image *source,
     struct gn_transport_image *transport, uint32_t array_index)
 {
+    /* Once initialized, this slot always transitions GENERAL -> TRANSFER -> GENERAL
+     * with the same source image/layer and destination. The producer cannot reacquire
+     * the slot until the consumer's release fence signals, so the same completed command
+     * buffer can be submitted again without resetting and rebuilding it every frame. */
+    if (transport->initialized && transport->steady_recorded) return 1;
+
     VkResult result = p_vkResetCommandBuffer(transport->command_buffer, 0);
     if (result != VK_SUCCESS) {
         log_vk_result("vkResetCommandBuffer(AHardwareBuffer)", result);
@@ -949,17 +957,7 @@ static int submit_ahardwarebuffer_copy(
         log_vk_result("vkEndCommandBuffer(AHardwareBuffer)", result);
         return 0;
     }
-    VkSubmitInfo submit = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &transport->command_buffer
-    };
-    result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        log_vk_result("vkQueueSubmit(AHardwareBuffer copy)", result);
-        return 0;
-    }
-    transport->initialized = 1;
+    if (transport->initialized) transport->steady_recorded = 1;
     return 1;
 }
 #endif
@@ -1046,6 +1044,9 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
         image->transport_kind[eye] = GN_TRANSPORT_DMABUF;
     }
     if (image->transport_kind[eye] == GN_TRANSPORT_AHARDWAREBUFFER) {
+        if (image->registered_array_index[eye] != array_index) {
+            image->transport[eye].steady_recorded = 0;
+        }
         image->registered_array_index[eye] = array_index;
         return 1;
     }
@@ -1121,10 +1122,28 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     return 1;
 }
 
-static int make_acquire_fence_fd(void)
+static int submit_and_make_acquire_fence_fd(
+    const VkCommandBuffer *commands, uint32_t command_count, int *submit_ok)
 {
-    if (!p_vkCreateFence || !p_vkQueueSubmit || !p_vkGetFenceFdKHR) {
-        if (p_vkQueueWaitIdle) p_vkQueueWaitIdle(queue);
+    *submit_ok = 0;
+    if (!p_vkQueueSubmit) return -1;
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = command_count,
+        .pCommandBuffers = command_count ? commands : NULL
+    };
+    const int can_export = p_vkCreateFence && p_vkDestroyFence &&
+        p_vkGetFenceFdKHR;
+    VkFence fence = VK_NULL_HANDLE;
+    if (!can_export) {
+        VkResult result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+        if (result != VK_SUCCESS) {
+            log_vk_result("vkQueueSubmit(stereo transport)", result);
+            return -1;
+        }
+        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS)
+            return -1;
+        *submit_ok = 1;
         return -1;
     }
     VkExportFenceCreateInfo export_info = {
@@ -1135,16 +1154,22 @@ static int make_acquire_fence_fd(void)
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = &export_info
     };
-    VkFence fence;
     if (p_vkCreateFence(device, &create_info, NULL, &fence) != VK_SUCCESS) {
-        if (p_vkQueueWaitIdle) p_vkQueueWaitIdle(queue);
+        VkResult result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+        if (result != VK_SUCCESS) {
+            log_vk_result("vkQueueSubmit(stereo transport fallback)", result);
+            return -1;
+        }
+        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS)
+            return -1;
+        *submit_ok = 1;
         return -1;
     }
-    if (p_vkQueueSubmit(queue, 0, NULL, fence) != VK_SUCCESS) {
+    if (p_vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) {
         p_vkDestroyFence(device, fence, NULL);
-        if (p_vkQueueWaitIdle) p_vkQueueWaitIdle(queue);
         return -1;
     }
+    *submit_ok = 1;
     VkFenceGetFdInfoKHR fd_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
         .fence = fence,
@@ -1153,7 +1178,12 @@ static int make_acquire_fence_fd(void)
     int fd = -1;
     if (p_vkGetFenceFdKHR(device, &fd_info, &fd) != VK_SUCCESS) fd = -1;
     p_vkDestroyFence(device, fence, NULL);
-    if (fd < 0 && p_vkQueueWaitIdle) p_vkQueueWaitIdle(queue);
+    if (fd < 0) {
+        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS) {
+            *submit_ok = 0;
+            return -1;
+        }
+    }
     return fd;
 }
 
@@ -1260,7 +1290,9 @@ static int32_t unix_create_swapchain(void *opaque)
     swapchain->format = (VkFormat)args->format;
     swapchain->array_size = args->array_size ? args->array_size : 1;
     swapchain->sample_count = args->sample_count ? args->sample_count : 1;
-    swapchain->image_count = 3; /* Triple buffering covers the requested double-buffer minimum. */
+    /* Two images reduce transport memory and keep the game from queueing a
+     * third stale frame ahead of the headset compositor. */
+    swapchain->image_count = 2;
     for (uint32_t i = 0; i < swapchain->image_count; ++i) {
         swapchain->images[i].dma_buf_fd = -1;
         if (!create_image(swapchain, &swapchain->images[i], args->array_size,
@@ -1363,63 +1395,28 @@ static int32_t unix_acquire_image(void *opaque)
     return 0;
 }
 
-static int32_t unix_submit_image(void *opaque)
+static int send_frame(const struct gn_unix_submit_view_args *view, int fence_fd)
 {
-    struct gn_unix_submit_image_args *args = opaque;
-    if (args->slot >= GN_UNIX_MAX_SWAPCHAINS || args->eye >= 2 ||
-        args->image_index >= swapchains[args->slot].image_count) {
-        args->result = GN_UNIX_ERROR_ARGUMENT;
-        return 0;
-    }
-    pthread_mutex_lock(&socket_mutex);
-    if (!register_image(args->slot, args->image_index, args->eye,
-                        args->array_index)) {
-        args->result = GN_UNIX_ERROR_TRANSPORT;
-        pthread_mutex_unlock(&socket_mutex);
-        return 0;
-    }
-#if defined(__ANDROID__)
-    struct gn_image *image =
-        &swapchains[args->slot].images[args->image_index];
-    if (image->transport_kind[args->eye] ==
-            GN_TRANSPORT_AHARDWAREBUFFER &&
-        !submit_ahardwarebuffer_copy(
-            &swapchains[args->slot], image,
-            &image->transport[args->eye], args->array_index)) {
-        const uint8_t bit = (uint8_t)(1u << args->eye);
-        log_line("AHardwareBuffer GPU copy failed; switching image to dma-buf");
-        destroy_transport_image(&image->transport[args->eye]);
-        image->transport_kind[args->eye] = GN_TRANSPORT_DMABUF;
-        image->registered_eye_mask &= (uint8_t)~bit;
-        if (!register_image(args->slot, args->image_index, args->eye,
-                            args->array_index)) {
-            args->result = GN_UNIX_ERROR_TRANSPORT;
-            pthread_mutex_unlock(&socket_mutex);
-            return 0;
-        }
-    }
-#endif
-    int fence_fd = make_acquire_fence_fd();
     char line[512], response[64] = {0};
     const uint32_t transport_index =
-        args->slot * GN_UNIX_MAX_IMAGES + args->image_index;
+        view->slot * GN_UNIX_MAX_IMAGES + view->image_index;
     snprintf(line, sizeof(line),
              "FRAME eye=%u index=%u fence=%u x=%d y=%d w=%u h=%u "
              "projection=1 qx=%lld qy=%lld qz=%lld qw=%lld "
              "px=%lld py=%lld pz=%lld fl=%lld fr=%lld fu=%lld fd=%lld\n",
-             args->eye, transport_index, fence_fd >= 0 ? 1u : 0u,
-             args->rect_x, args->rect_y, args->rect_width, args->rect_height,
-             (long long)args->orientation_micro[0],
-             (long long)args->orientation_micro[1],
-             (long long)args->orientation_micro[2],
-             (long long)args->orientation_micro[3],
-             (long long)args->position_micro[0],
-             (long long)args->position_micro[1],
-             (long long)args->position_micro[2],
-             (long long)args->fov_micro[0],
-             (long long)args->fov_micro[1],
-             (long long)args->fov_micro[2],
-             (long long)args->fov_micro[3]);
+             view->eye, transport_index, fence_fd >= 0 ? 1u : 0u,
+             view->rect_x, view->rect_y, view->rect_width, view->rect_height,
+             (long long)view->orientation_micro[0],
+             (long long)view->orientation_micro[1],
+             (long long)view->orientation_micro[2],
+             (long long)view->orientation_micro[3],
+             (long long)view->position_micro[0],
+             (long long)view->position_micro[1],
+             (long long)view->position_micro[2],
+             (long long)view->fov_micro[0],
+             (long long)view->fov_micro[1],
+             (long long)view->fov_micro[2],
+             (long long)view->fov_micro[3]);
     int ok = 0;
     if (fence_fd >= 0) {
         ok = transact_line(line, response, sizeof(response)) &&
@@ -1427,7 +1424,6 @@ static int32_t unix_submit_image(void *opaque)
              send_fd(transport_fd, fence_fd) &&
              read_line(transport_fd, response, sizeof(response)) &&
              !strncmp(response, "OK", 2);
-        close(fence_fd);
     } else {
         ok = transact_line(line, response, sizeof(response)) &&
              !strncmp(response, "OK", 2);
@@ -1436,20 +1432,112 @@ static int32_t unix_submit_image(void *opaque)
         char trace[192];
         snprintf(trace, sizeof(trace),
                  "frame transport failed eye=%u index=%u response=%s",
-                 args->eye, transport_index, response[0] ? response : "<none>");
+                 view->eye, transport_index, response[0] ? response : "<none>");
         log_line(trace);
         close_transport();
-    } else if (!transport_frame_announced[args->eye]) {
+    } else if (!transport_frame_announced[view->eye]) {
         char trace[160];
         snprintf(trace, sizeof(trace),
                  "first transported frame eye=%u index=%u fence=%u",
-                 args->eye, transport_index, fence_fd >= 0 ? 1u : 0u);
+                 view->eye, transport_index, fence_fd >= 0 ? 1u : 0u);
         log_line(trace);
-        transport_frame_announced[args->eye] = 1;
+        transport_frame_announced[view->eye] = 1;
     }
-    swapchains[args->slot].images[args->image_index].submitted = ok ? 1 : 0;
-    args->result = ok ? GN_UNIX_SUCCESS : GN_UNIX_ERROR_TRANSPORT;
+    swapchains[view->slot].images[view->image_index].submitted = ok ? 1 : 0;
+    return ok;
+}
+
+static int submit_views(
+    const struct gn_unix_submit_view_args *views, uint32_t view_count)
+{
+    if (!view_count || view_count > 2) return 0;
+    for (uint32_t i = 0; i < view_count; ++i) {
+        const struct gn_unix_submit_view_args *view = &views[i];
+        if (view->slot >= GN_UNIX_MAX_SWAPCHAINS || view->eye >= 2 ||
+            view->image_index >= swapchains[view->slot].image_count)
+            return 0;
+    }
+
+    pthread_mutex_lock(&socket_mutex);
+    VkCommandBuffer commands[2];
+    struct gn_transport_image *recorded[2];
+    uint32_t command_count = 0;
+    for (uint32_t i = 0; i < view_count; ++i) {
+        const struct gn_unix_submit_view_args *view = &views[i];
+        if (!register_image(view->slot, view->image_index, view->eye,
+                            view->array_index)) {
+            pthread_mutex_unlock(&socket_mutex);
+            return 0;
+        }
+#if defined(__ANDROID__)
+        struct gn_image *image =
+            &swapchains[view->slot].images[view->image_index];
+        if (image->transport_kind[view->eye] == GN_TRANSPORT_AHARDWAREBUFFER) {
+            struct gn_transport_image *transport = &image->transport[view->eye];
+            if (!record_ahardwarebuffer_copy(
+                    &swapchains[view->slot], image, transport,
+                    view->array_index)) {
+                const uint8_t bit = (uint8_t)(1u << view->eye);
+                log_line("AHardwareBuffer GPU copy failed; switching image to dma-buf");
+                destroy_transport_image(transport);
+                image->transport_kind[view->eye] = GN_TRANSPORT_DMABUF;
+                image->registered_eye_mask &= (uint8_t)~bit;
+                if (!register_image(view->slot, view->image_index, view->eye,
+                                    view->array_index)) {
+                    pthread_mutex_unlock(&socket_mutex);
+                    return 0;
+                }
+            } else {
+                commands[command_count] = transport->command_buffer;
+                recorded[command_count] = transport;
+                ++command_count;
+            }
+        }
+#endif
+    }
+
+    int submit_ok = 0;
+    int fence_fd = submit_and_make_acquire_fence_fd(
+        commands, command_count, &submit_ok);
+    if (!submit_ok) {
+        if (fence_fd >= 0) close(fence_fd);
+        pthread_mutex_unlock(&socket_mutex);
+        return 0;
+    }
+    for (uint32_t i = 0; i < command_count; ++i) recorded[i]->initialized = 1;
+
+    int ok = 1;
+    for (uint32_t i = 0; i < view_count; ++i) {
+        const int view_fence_fd = i == 0 ? fence_fd : -1;
+        if (!send_frame(&views[i], view_fence_fd)) {
+            ok = 0;
+            break;
+        }
+    }
+    if (fence_fd >= 0) close(fence_fd);
+
     pthread_mutex_unlock(&socket_mutex);
+    return ok;
+}
+
+static int32_t unix_submit_image(void *opaque)
+{
+    struct gn_unix_submit_image_args *args = opaque;
+    args->result = submit_views(
+        (const struct gn_unix_submit_view_args *)args, 1) ?
+        GN_UNIX_SUCCESS : GN_UNIX_ERROR_TRANSPORT;
+    return 0;
+}
+
+static int32_t unix_submit_stereo(void *opaque)
+{
+    struct gn_unix_submit_stereo_args *args = opaque;
+    if (!args->view_count || args->view_count > 2) {
+        args->result = GN_UNIX_ERROR_ARGUMENT;
+        return 0;
+    }
+    args->result = submit_views(args->views, args->view_count) ?
+        GN_UNIX_SUCCESS : GN_UNIX_ERROR_TRANSPORT;
     return 0;
 }
 
@@ -1460,7 +1548,8 @@ const unixlib_entry_t __wine_unix_call_funcs[GN_UNIX_CALL_COUNT] = {
     unix_create_swapchain,
     unix_destroy_swapchain,
     unix_acquire_image,
-    unix_submit_image
+    unix_submit_image,
+    unix_submit_stereo
 };
 
 /* Wine selects this table for a 32-bit PE running under a 64-bit wineserver.
@@ -1472,7 +1561,8 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[GN_UNIX_CALL_COUNT] = {
     unix_create_swapchain,
     unix_destroy_swapchain,
     unix_acquire_image,
-    unix_submit_image
+    unix_submit_image,
+    unix_submit_stereo
 };
 
 __attribute__((destructor))

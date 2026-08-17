@@ -23,12 +23,15 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
+import org.json.JSONObject
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.io.File
 import java.lang.reflect.Field
 import java.util.EnumSet
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class ContainerConfigDialogContainerUpdateTest {
 
     private lateinit var context: Context
@@ -434,6 +437,38 @@ class ContainerConfigDialogContainerUpdateTest {
         assertEquals("wrapper-v2", container.graphicsDriver)
         assertEquals("25.3.0", container.graphicsDriverVersion)
         assertEquals(graphicsConfig, container.graphicsDriverConfig)
+    }
+
+    @Test
+    fun wrapperGamenative_andVrSettings_surviveDiskReload() {
+        val containerData = ContainerData(
+            graphicsDriver = "wrapper-gamenative",
+            graphicsDriverVersion = "v805",
+            graphicsDriverConfig = "version=v805;transcoder=gpu;quality=low",
+            dxwrapper = "dxvk",
+            dxwrapperConfig = "version=2.4.1-gplasync;async=1",
+            xrRenderScale = 70,
+            xrFramePacingDivisor = 2,
+            xrOpenCompositeEnabled = false,
+            xrTheaterScreenEnabled = false,
+            xrClockEnabled = false,
+        )
+
+        ContainerUtils.applyToContainer(context, container, containerData, saveToDisk = true)
+
+        val reloaded = Container(container.id).apply {
+            setRootDir(tempDir)
+            loadData(JSONObject(configFile.readText()))
+        }
+
+        assertEquals("wrapper-gamenative", reloaded.graphicsDriver)
+        assertEquals("v805", reloaded.graphicsDriverVersion)
+        assertEquals("dxvk", reloaded.dxWrapper)
+        assertEquals("2", reloaded.getExtra("xrFramePacingDivisor"))
+        assertEquals("70", reloaded.getExtra("xrRenderScale"))
+        assertEquals("false", reloaded.getExtra("xrOpenCompositeEnabled"))
+        assertEquals("false", reloaded.getExtra("xrTheaterScreenEnabled"))
+        assertEquals("false", reloaded.getExtra("xrClockEnabled"))
     }
 
     @Test

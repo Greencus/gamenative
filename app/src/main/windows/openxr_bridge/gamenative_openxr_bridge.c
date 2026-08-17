@@ -2267,69 +2267,78 @@ static XrResult XRAPI_CALL gn_xrEndFrame(XrSession session, const XrFrameEndInfo
             submission_failed = 1;
             continue;
         }
+        struct gn_unix_submit_stereo_args args;
+        args.view_count = projection->viewCount;
+        int projection_ready = 1;
         for (gn_uint32 eye = 0; eye < projection->viewCount; ++eye) {
             int slot = gn_swapchain_index(
                 projection->views[eye].subImage.swapchain);
             GnSwapchain* state = &gn_swapchains[slot];
             if (!state->last_released_valid) {
                 submission_failed = 1;
-                continue;
+                projection_ready = 0;
+                break;
             }
-            struct gn_unix_submit_image_args args;
-            args.slot = (gn_u32)slot;
-            args.image_index = state->last_released_image;
-            args.eye = eye;
-            args.array_index =
+            struct gn_unix_submit_view_args* view = &args.views[eye];
+            view->slot = (gn_u32)slot;
+            view->image_index = state->last_released_image;
+            view->eye = eye;
+            view->array_index =
                 projection->views[eye].subImage.imageArrayIndex;
-            args.rect_x =
+            view->rect_x =
                 projection->views[eye].subImage.imageRect.offset.x;
-            args.rect_y =
+            view->rect_y =
                 projection->views[eye].subImage.imageRect.offset.y;
-            args.rect_width = (gn_u32)
+            view->rect_width = (gn_u32)
                 projection->views[eye].subImage.imageRect.extent.width;
-            args.rect_height = (gn_u32)
+            view->rect_height = (gn_u32)
                 projection->views[eye].subImage.imageRect.extent.height;
             {
                 XrPosef absolute_view = gn_pose_multiply(
                     layer_space_pose, projection->views[eye].pose);
-                args.orientation_micro[0] =
+                view->orientation_micro[0] =
                     gn_float_to_micro(absolute_view.orientation.x);
-                args.orientation_micro[1] =
+                view->orientation_micro[1] =
                     gn_float_to_micro(absolute_view.orientation.y);
-                args.orientation_micro[2] =
+                view->orientation_micro[2] =
                     gn_float_to_micro(absolute_view.orientation.z);
-                args.orientation_micro[3] =
+                view->orientation_micro[3] =
                     gn_float_to_micro(absolute_view.orientation.w);
-                args.position_micro[0] =
+                view->position_micro[0] =
                     gn_float_to_micro(absolute_view.position.x);
-                args.position_micro[1] =
+                view->position_micro[1] =
                     gn_float_to_micro(absolute_view.position.y);
-                args.position_micro[2] =
+                view->position_micro[2] =
                     gn_float_to_micro(absolute_view.position.z);
-                args.fov_micro[0] = gn_float_to_micro(
+                view->fov_micro[0] = gn_float_to_micro(
                     projection->views[eye].fov.angleLeft);
-                args.fov_micro[1] = gn_float_to_micro(
+                view->fov_micro[1] = gn_float_to_micro(
                     projection->views[eye].fov.angleRight);
-                args.fov_micro[2] = gn_float_to_micro(
+                view->fov_micro[2] = gn_float_to_micro(
                     projection->views[eye].fov.angleUp);
-                args.fov_micro[3] = gn_float_to_micro(
+                view->fov_micro[3] = gn_float_to_micro(
                     projection->views[eye].fov.angleDown);
             }
-            args.result = GN_UNIX_ERROR_UNAVAILABLE;
-            if (!gn_unix_call(GN_UNIX_SUBMIT_IMAGE, &args) ||
-                args.result != GN_UNIX_SUCCESS) {
-                submission_failed = 1;
-                if (!gn_transport_failure_logged) {
-                    gn_log_num("xrEndFrame image transport failed result=", args.result);
-                    gn_transport_failure_logged = 1;
-                }
-            } else {
+        }
+        if (!projection_ready) continue;
+        args.result = GN_UNIX_ERROR_UNAVAILABLE;
+        if (!gn_unix_call(GN_UNIX_SUBMIT_STEREO, &args) ||
+            args.result != GN_UNIX_SUCCESS) {
+            submission_failed = 1;
+            if (!gn_transport_failure_logged) {
+                gn_log_num("xrEndFrame stereo transport failed result=", args.result);
+                gn_transport_failure_logged = 1;
+            }
+        } else {
+            for (gn_uint32 eye = 0; eye < projection->viewCount; ++eye) {
+                int slot = (int)args.views[eye].slot;
+                GnSwapchain* state = &gn_swapchains[slot];
                 state->submitted[state->last_released_image] = 1;
                 gn_transport_eye_mask |= (1u << eye);
-                if (gn_transport_eye_mask == 3u) {
-                    gn_log_line("xrEndFrame image transport accepted both eyes");
-                    gn_transport_eye_mask |= 4u;
-                }
+            }
+            if (gn_transport_eye_mask == 3u) {
+                gn_log_line("xrEndFrame batched image transport accepted both eyes");
+                gn_transport_eye_mask |= 4u;
             }
         }
     }

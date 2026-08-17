@@ -414,25 +414,17 @@ object ContainerUtils {
 
     /** Persist only the per-container VR settings without running the full container update. */
     fun applyXrSettings(context: Context, appId: String, containerData: ContainerData) {
-        val container = getContainer(context, appId)
         val requested = XrContainerSettings.from(containerData)
         check(XrContainerSettings.persist(context, appId, requested)) {
             "Could not persist VR settings for $appId"
         }
-        XrContainerSettings.write(container, requested)
-        container.putExtra("config_changed", "true")
-        container.saveData()
-
-        val reloadedContainer = getContainer(context, appId)
-        val persisted = XrContainerSettings.read(context, appId, reloadedContainer)
-        val mirrored = XrContainerSettings.read(reloadedContainer)
-        if (persisted != requested || mirrored != requested) {
+        val persisted = XrContainerSettings.read(context, appId, getContainer(context, appId))
+        if (persisted != requested) {
             Timber.e(
-                "VR settings verification failed for %s: requested=%s persisted=%s mirrored=%s",
+                "VR settings verification failed for %s: requested=%s persisted=%s",
                 appId,
                 requested,
                 persisted,
-                mirrored,
             )
             throw IllegalStateException("Could not persist VR settings for $appId")
         }
@@ -659,19 +651,71 @@ object ContainerUtils {
         Timber.d("Container set: preferredInputApi=%s, dinputMapperType=0x%02x", api, containerData.dinputMapperType)
 
         if (saveToDisk) {
-            // VR preferences belong to the persisted container configuration. Temporary launch
-            // overrides also call this method with saveToDisk=false and the same Container
-            // instance; changing these extras there lets later launch-time saveData() calls
-            // accidentally persist override defaults over the user's VR settings.
-            XrContainerSettings.write(
-                container,
-                XrContainerSettings.read(context, container.id, container),
-            )
+            // Save one complete settings snapshot. Keeping the general container write and the
+            // dedicated XR preferences in separate UI callbacks allowed the XR callback to
+            // succeed while the normal container callback was skipped, leaving all non-VR
+            // settings at their previous values.
+            val xrSettings = XrContainerSettings.from(containerData)
+            XrContainerSettings.write(container, xrSettings)
             // Mark that config has been changed, so we can show feedback dialog after next game run
             container.putExtra("config_changed", "true")
             container.saveData()
+
+            val xrPreferencesSaved = XrContainerSettings.persist(context, container.id, xrSettings)
+            if (!xrPreferencesSaved) {
+                Timber.e("Could not persist dedicated VR settings for %s", container.id)
+            }
+
+            verifyPersistedSettings(container, containerData)
         }
         Timber.d("Set container.execArgs to '${containerData.execArgs}'")
+    }
+
+    private fun verifyPersistedSettings(container: Container, expected: ContainerData) {
+        val configFile = container.configFile
+        val persisted = runCatching { JSONObject(configFile.readText()) }
+            .onFailure { error ->
+                Timber.e(error, "Could not verify saved container settings for %s", container.id)
+            }
+            .getOrNull() ?: return
+
+        val mismatches = buildList {
+            fun compare(key: String, expectedValue: Any) {
+                val actual = persisted.opt(key)?.toString() ?: "<missing>"
+                if (actual != expectedValue.toString()) {
+                    add("$key expected=$expectedValue actual=$actual")
+                }
+            }
+
+            compare("graphicsDriver", expected.graphicsDriver)
+            compare("graphicsDriverVersion", expected.graphicsDriverVersion)
+            compare("dxwrapper", expected.dxwrapper)
+            compare("containerVariant", expected.containerVariant)
+            compare("wineVersion", expected.wineVersion)
+            compare("emulator", expected.emulator)
+            compare("fexcoreVersion", expected.fexcoreVersion)
+            compare("box64Version", expected.box64Version)
+            compare("box64Preset", expected.box64Preset)
+            compare("cpuList", expected.cpuList)
+            compare("cpuListWoW64", expected.cpuListWoW64)
+        }
+
+        if (mismatches.isEmpty()) {
+            Timber.i(
+                "Container settings persisted for %s: graphicsDriver=%s dxwrapper=%s wine=%s emulator=%s",
+                container.id,
+                expected.graphicsDriver,
+                expected.dxwrapper,
+                expected.wineVersion,
+                expected.emulator,
+            )
+        } else {
+            Timber.e(
+                "Container settings persistence verification failed for %s: %s",
+                container.id,
+                mismatches.joinToString("; "),
+            )
+        }
     }
 
     private fun mapLanguageToLocale(language: String): String {

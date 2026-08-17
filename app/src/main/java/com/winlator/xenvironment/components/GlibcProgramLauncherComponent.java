@@ -175,7 +175,7 @@ public class GlibcProgramLauncherComponent extends GuestProgramLauncherComponent
         File rootDir = imageFs.getRootDir();
 
         PrefManager.init(context);
-        boolean enableBox86_64Logs = PrefManager.getBoolean("enable_box86_64_logs", true);
+        boolean enableBox86_64Logs = PrefManager.getBoolean("enable_box86_64_logs", false);
 
         EnvVars envVars = new EnvVars();
         addBox64EnvVars(envVars, enableBox86_64Logs);

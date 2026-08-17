@@ -135,6 +135,8 @@ import app.gamenative.utils.WineProcessSnapshotHelper
 import app.gamenative.xr.XrRuntimeManager
 import app.gamenative.xr.QuestVrActivity
 import app.gamenative.xr.XrGraphicsPolicy
+import app.gamenative.xr.XrEmulationDiagnostics
+import app.gamenative.xr.XrLaunchDiagnostics
 import app.gamenative.xr.XrPayloadManager
 import app.gamenative.xr.XrXServerView
 import app.gamenative.xr.XrLaunchPreferences
@@ -217,6 +219,8 @@ import org.json.JSONException
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.File
+import java.io.BufferedWriter
+import java.io.FileWriter
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Paths
@@ -229,6 +233,38 @@ import kotlin.io.path.name
 import kotlin.math.roundToInt
 import kotlin.text.lowercase
 import com.winlator.PrefManager as WinlatorPrefManager
+
+private class BufferedProcessLogCallback(file: File) : Callback<String>, AutoCloseable {
+    private val writer = BufferedWriter(FileWriter(file, false), 64 * 1024)
+    private var linesSinceFlush = 0
+    private var lastFlushNs = System.nanoTime()
+    private var failed = false
+
+    @Synchronized
+    override fun call(objectValue: String) {
+        if (failed) return
+        try {
+            writer.write(objectValue)
+            writer.newLine()
+            linesSinceFlush++
+            val now = System.nanoTime()
+            if (linesSinceFlush >= 64 || now - lastFlushNs >= 1_000_000_000L) {
+                writer.flush()
+                linesSinceFlush = 0
+                lastFlushNs = now
+            }
+        } catch (error: IOException) {
+            failed = true
+            Timber.w(error, "Wine diagnostic log writer failed")
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        runCatching { writer.close() }
+            .onFailure { Timber.w(it, "Could not close Wine diagnostic log") }
+    }
+}
 
 // Always re-extract drivers and DXVK on every launch to handle cases of container corruption
 // where games randomly stop working. Set to false once corruption issues are resolved.
@@ -389,8 +425,35 @@ private fun buildEssentialProcessAllowlist(): Set<String> {
 
 // TODO logs in composables are 'unstable' which can cause recomposition (performance issues)
 
+private data class XServerScreenArgs(
+    val appId: String,
+    val bootToContainer: Boolean,
+    val testGraphics: Boolean,
+    val diagnostics: Boolean,
+    val isOffline: Boolean,
+    val launchInfoOverride: LaunchInfo?,
+    val registerBackAction: ((() -> Unit) -> Unit),
+    val navigateBack: () -> Unit,
+    val onExit: (onComplete: (() -> Unit)?) -> Unit,
+    val onWindowMapped: ((Context, Window) -> Unit)?,
+    val onWindowUnmapped: ((Window) -> Unit)?,
+    val onGameLaunchError: ((String) -> Unit)?,
+    val onGameLaunchStage: ((String) -> Unit)?,
+)
+
+private fun recordXrEmulationLaunch(
+    context: Context,
+    container: Container,
+    launcher: GuestProgramLauncherComponent,
+) {
+    if (context !is QuestVrActivity) return
+    XrLaunchDiagnostics.record(
+        context,
+        XrEmulationDiagnostics.effectiveLaunchSnapshot(container, launcher),
+    )
+}
+
 @Composable
-@OptIn(ExperimentalComposeUiApi::class)
 fun XServerScreen(
     lifecycleOwner: LifecycleOwner = LocalLifecycleOwner.current,
     appId: String,
@@ -407,6 +470,32 @@ fun XServerScreen(
     onGameLaunchError: ((String) -> Unit)? = null,
     onGameLaunchStage: ((String) -> Unit)? = null,
 ) {
+    XServerScreenArgs(
+        appId = appId,
+        bootToContainer = bootToContainer,
+        testGraphics = testGraphics,
+        diagnostics = diagnostics,
+        isOffline = isOffline,
+        launchInfoOverride = launchInfoOverride,
+        registerBackAction = registerBackAction,
+        navigateBack = navigateBack,
+        onExit = onExit,
+        onWindowMapped = onWindowMapped,
+        onWindowUnmapped = onWindowUnmapped,
+        onGameLaunchError = onGameLaunchError,
+        onGameLaunchStage = onGameLaunchStage,
+    ).Content(lifecycleOwner)
+}
+
+/**
+ * Keep the enormous X-server composition behind one receiver argument. ART on Quest rejects
+ * the otherwise valid DEX when all screen callbacks and Compose temporaries share the same
+ * 256+ register method frame. The small public wrapper preserves the call-site API while this
+ * receiver keeps the generated content method comfortably below that verifier boundary.
+ */
+@Composable
+@OptIn(ExperimentalComposeUiApi::class)
+private fun XServerScreenArgs.Content(lifecycleOwner: LifecycleOwner) {
     Timber.i("Starting up XServerScreen")
     val context = LocalContext.current
     val view = LocalView.current
@@ -3675,9 +3764,9 @@ private fun setupXEnvironment(
     }
 
     if (captureLogs) {
-        ProcessHelper.addDebugCallback { line ->
-            logFile?.appendText(line + "\n")
-        }
+        runCatching { BufferedProcessLogCallback(requireNotNull(logFile)) }
+            .onSuccess { ProcessHelper.addDebugCallback(it) }
+            .onFailure { Timber.w(it, "Could not create Wine diagnostic log writer") }
     }
 
     val rootPath = imageFs.getRootDir().getPath()
@@ -3806,6 +3895,7 @@ private fun setupXEnvironment(
         if (guestProgramLauncherComponent is BionicProgramLauncherComponent) {
             guestProgramLauncherComponent.setFEXCorePreset(container.fexCorePreset)
         }
+        recordXrEmulationLaunch(context, container, guestProgramLauncherComponent)
         guestProgramLauncherComponent.setPreUnpack {
             unpackExecutableFile(
                 context = context,
@@ -5573,7 +5663,7 @@ private suspend fun extractGraphicsDriverFiles(
             sentinel.writeText(cacheId)
         }
         if (dxwrapper.contains("dxvk")) {
-            DXVKHelper.setEnvVars(context, dxwrapperConfig, envVars)
+            DXVKHelper.setEnvVars(context, dxwrapperConfig, envVars, PluviaApp.isVrSessionActive)
         } else if (dxwrapper.contains("vkd3d")) {
             DXVKHelper.setVKD3DEnvVars(context, dxwrapperConfig, envVars)
         }
@@ -5701,7 +5791,7 @@ private suspend fun extractGraphicsDriverFiles(
         val rootDir: File? = imageFs.getRootDir()
 
         if (dxwrapper.contains("dxvk")) {
-            DXVKHelper.setEnvVars(context, dxwrapperConfig, envVars)
+            DXVKHelper.setEnvVars(context, dxwrapperConfig, envVars, PluviaApp.isVrSessionActive)
             val version = dxwrapperConfig.get("version")
             if (version == "1.11.1-sarek") {
                 Timber.tag("GraphicsDriverExtraction").d("Disabling Wrapper PATCH_OPCONSTCOMP SPIR-V pass")

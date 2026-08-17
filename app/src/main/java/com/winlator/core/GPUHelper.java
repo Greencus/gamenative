@@ -8,7 +8,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -26,12 +26,20 @@ public abstract class GPUHelper {
         System.loadLibrary("winlator_11");
     }
 
-    private static final Executor io =
-            Executors.newSingleThreadExecutor();        // created once
+    // Start the one-time query immediately, then retire its worker and native stack.
+    private static final CompletableFuture<Integer> apiVersionFuture = queryApiVersion();
 
-    // start the work immediately; runs exactly once
-    private static final CompletableFuture<Integer> apiVersionFuture =
-            CompletableFuture.supplyAsync(GPUHelper::vkGetApiVersion, io);
+    private static CompletableFuture<Integer> queryApiVersion() {
+        ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "vulkan-version-query");
+            thread.setDaemon(true);
+            return thread;
+        });
+        CompletableFuture<Integer> future =
+                CompletableFuture.supplyAsync(GPUHelper::vkGetApiVersion, executor);
+        future.whenComplete((value, error) -> executor.shutdown());
+        return future;
+    }
 
     // Note: Removed @CriticalNative to allow proper JNI error handling and logging
     // in the native implementation. Performance is not impacted since this is

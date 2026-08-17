@@ -180,7 +180,7 @@ class PhysicalControllerHandler(
      */
     private fun createMouseMoveTimer() {
         if (profile != null && mouseMoveTimer == null) {
-            mouseMoveTimer = Timer()
+            mouseMoveTimer = Timer("controller-mouse-move", true)
             mouseMoveTimer?.schedule(object : TimerTask() {
                 override fun run() {
                     // Skip injection if movement is below 8% deadzone to save CPU cycles
@@ -223,7 +223,7 @@ class PhysicalControllerHandler(
 
     private fun createScrollRepeatTimerLocked() {
         if (scrollRepeatTimer != null) return
-        scrollRepeatTimer = Timer()
+        scrollRepeatTimer = Timer("controller-scroll-repeat", true)
         scrollRepeatTimer?.schedule(object : TimerTask() {
             override fun run() {
                 val bindings = synchronized(scrollRepeatLock) {

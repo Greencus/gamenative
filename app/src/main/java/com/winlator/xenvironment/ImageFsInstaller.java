@@ -39,11 +39,17 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 
 public abstract class ImageFsInstaller {
     public static final byte LATEST_VERSION = 30;
+    private static final ExecutorService INSTALL_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "imagefs-installer");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private static void resetContainerImgVersions(Context context) {
         ContainerManager manager = new ContainerManager(context);
@@ -116,7 +122,7 @@ public abstract class ImageFsInstaller {
 
         // final DownloadProgressDialog dialog = new DownloadProgressDialog(context);
         // dialog.show(R.string.installing_system_files);
-        return Executors.newSingleThreadExecutor().submit(() -> {
+        return INSTALL_EXECUTOR.submit(() -> {
             clearRootDir(context, rootDir);
             ensureSharedHomeRoot(context, rootDir);
             ensureProtonVersionSymlink(context, rootDir, wineVersion);
@@ -254,7 +260,7 @@ public abstract class ImageFsInstaller {
         String wineVersion = container.getWineVersion();
         if (!ImageFSLegacyMigrator.migrateLegacyDirsIfNeeded(context, imageFs.getRootDir(), wineVersion)) {
             Log.w("ImageFsInstaller", "Failed to migrate legacy directories before installation.");
-            return Executors.newSingleThreadExecutor().submit(() -> false);
+            return INSTALL_EXECUTOR.submit(() -> false);
         }
         if (!imageFs.isValid() || imageFs.getVersion() < LATEST_VERSION || !imageFs.getVariant().equals(container.getContainerVariant())) {
             Log.d("ImageFsInstaller", "Installing image from assets");
@@ -267,7 +273,7 @@ public abstract class ImageFsInstaller {
             );
         } else {
             Log.d("ImageFsInstaller", "Image FS already valid and at latest version");
-            return Executors.newSingleThreadExecutor().submit(() -> {
+            return INSTALL_EXECUTOR.submit(() -> {
                 ensureBionicLib(context, imageFs.getRootDir());
                 return true;
             });
@@ -346,7 +352,7 @@ public abstract class ImageFsInstaller {
         // AppUtils.keepScreenOn(context);
         // PreloaderDialog preloaderDialog = new PreloaderDialog(context);
         // preloaderDialog.show(R.string.loading);
-        Executors.newSingleThreadExecutor().execute(() -> {
+        INSTALL_EXECUTOR.execute(() -> {
             File[] srcFiles, dstFiles;
             File rootDir = ImageFs.find(context).getRootDir();
             File wineSystem32Dir = new File(rootDir, "/opt/wine/lib/wine/x86_64-windows");

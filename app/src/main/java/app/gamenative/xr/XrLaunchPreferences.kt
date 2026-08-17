@@ -1,6 +1,8 @@
 package app.gamenative.xr
 
+import android.content.Context
 import app.gamenative.data.LaunchInfo
+import app.gamenative.utils.ContainerUtils
 import com.winlator.container.Container
 
 object XrLaunchPreferences {
@@ -28,12 +30,18 @@ object XrLaunchPreferences {
         container.getExtra(PROMPT_EVERY_LAUNCH_EXTRA, "true").toBooleanStrictOrNull() != false
 
     fun save(
-        container: Container,
+        context: Context,
+        appId: String,
         mode: String,
         steamLaunchIndex: Int = -1,
-        customArgs: String = customArgs(container),
-        promptEveryLaunch: Boolean = shouldPromptEveryLaunch(container),
+        customArgs: String,
+        promptEveryLaunch: Boolean,
     ) {
+        // Never save launch preferences through a Container retained by Compose. A different
+        // Container instance may have persisted regular settings since that object was loaded;
+        // Container.saveData() serializes the complete snapshot and would restore every stale
+        // field. Reload immediately before changing the launch extras instead.
+        val container = ContainerUtils.getContainer(context, appId)
         container.putExtra(VR_MODE_EXTRA, mode)
         container.putExtra(STEAM_LAUNCH_INDEX_EXTRA, steamLaunchIndex)
         container.putExtra(CUSTOM_ARGS_EXTRA, customArgs.trim())

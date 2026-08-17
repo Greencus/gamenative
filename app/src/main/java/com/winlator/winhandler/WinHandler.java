@@ -46,7 +46,6 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
 
 import timber.log.Timber;
 
@@ -476,7 +475,7 @@ public class WinHandler {
     }
 
     private void startSendThread() {
-        Executors.newSingleThreadExecutor().execute(() -> {
+        Thread sendThread = new Thread(() -> {
             while (this.running) {
                 synchronized (this.actions) {
                     while (this.initReceived && !this.actions.isEmpty()) {
@@ -488,7 +487,9 @@ public class WinHandler {
                     }
                 }
             }
-        });
+        }, "winhandler-send");
+        sendThread.setDaemon(true);
+        sendThread.start();
     }
 
     public void stop() {
@@ -739,7 +740,7 @@ public class WinHandler {
         refreshControllerMappings();
         this.running = true;
         startSendThread();
-        Executors.newSingleThreadExecutor().execute(() -> {
+        Thread receiveThread = new Thread(() -> {
             try {
                 DatagramSocket datagramSocket = new DatagramSocket((SocketAddress) null);
                 this.socket = datagramSocket;
@@ -755,7 +756,9 @@ public class WinHandler {
                 }
             } catch (IOException ignored) {
             }
-        });
+        }, "winhandler-receive");
+        receiveThread.setDaemon(true);
+        receiveThread.start();
         startRumblePoller();
     }
 

@@ -4,13 +4,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.SurfaceTexture
-import android.graphics.PorterDuff
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
-import android.view.InputDevice
-import android.view.KeyCharacterMap
-import android.view.KeyEvent
 import android.view.Surface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -67,19 +62,10 @@ class QuestVrActivity : ComponentActivity() {
     @Volatile private var pendingBridgeMilestone: String? = null
     @Volatile private var launchFailurePending: Boolean = false
     @Volatile private var vrQuickMenuVisible: Boolean = false
-    @Volatile private var vrQuickMenuToggle: (() -> Unit)? = null
     private val lastVrButtons = IntArray(2)
     private val neutralVrMenuInput = Array(2) { FloatArray(18) }
-    private var lastVrMenuDirection = 0
-    private var nextVrMenuRepeatAtMs = 0L
-    private var lastVrMenuTriggerPressed = false
-    private val vrMenuCaptureRunnable = object : Runnable {
-        override fun run() {
-            if (!vrQuickMenuVisible) return
-            captureVrMenuFrame()
-            window.decorView.postDelayed(this, VR_MENU_CAPTURE_INTERVAL_MS)
-        }
-    }
+    private var vrSettingsPanelRenderer: VrSettingsPanelRenderer? = null
+    private var vrAppId: String = ""
     private var xrContainerSettings = XrContainerSettings.Values()
 
     override fun attachBaseContext(newBase: Context) {
@@ -95,6 +81,9 @@ class QuestVrActivity : ComponentActivity() {
         ControllerManager.getInstance().init(applicationContext)
         ContainerUtils.setContainerDefaults(applicationContext)
         PluviaApp.events.emit(AndroidEvent.SetSystemUIVisibility(false))
+        // A previous activity may have finished while stereo presentation was suspended.
+        // Always permit the startup/theater renderer until native stereo is proven active.
+        QuestVrSurfaceRegistry.setPresentationSuspended(false)
 
         val appId = intent.getStringExtra(QuestVrLauncher.EXTRA_APP_ID).orEmpty()
         if (appId.isBlank()) {
@@ -104,6 +93,7 @@ class QuestVrActivity : ComponentActivity() {
             finish()
             return
         }
+        vrAppId = appId
 
         val bootToContainer = intent.getBooleanExtra(QuestVrLauncher.EXTRA_BOOT_TO_CONTAINER, false)
         val testGraphics = intent.getBooleanExtra(QuestVrLauncher.EXTRA_TEST_GRAPHICS, false)
@@ -122,8 +112,18 @@ class QuestVrActivity : ComponentActivity() {
             "VR activity created; executable=${resolvedExecutable.ifBlank { "<container default>" }} " +
                 "arguments=${launchInfoOverride?.arguments.orEmpty().ifBlank { "<none>" }}",
         )
-        xrContainerSettings = runCatching {
-            val container = ContainerUtils.getContainer(applicationContext, appId)
+        val launchContainer = runCatching {
+            ContainerUtils.getContainer(applicationContext, appId)
+        }.onSuccess { container ->
+            XrLaunchDiagnostics.record(
+                this,
+                XrEmulationDiagnostics.savedAndLoadedSnapshot(container),
+            )
+        }.onFailure { error ->
+            Timber.w(error, "Could not read launch container; using default VR settings")
+            XrLaunchDiagnostics.record(this, "Could not read launch container: ${error.message}", error)
+        }
+        xrContainerSettings = launchContainer.map { container ->
             val persisted = XrContainerSettings.read(applicationContext, appId, container)
             persisted.copy(
                 renderScale = if (intent.hasExtra(QuestVrLauncher.EXTRA_RENDER_SCALE)) {
@@ -179,6 +179,11 @@ class QuestVrActivity : ComponentActivity() {
         Timber.i("GameNativeVR container settings: $settingsSummary")
         XrLaunchDiagnostics.record(this, "VR container settings: $settingsSummary")
         bridgeServer.setFramePacingDivisor(xrContainerSettings.framePacingDivisor)
+        vrSettingsPanelRenderer = VrSettingsPanelRenderer(
+            initialValues = xrContainerSettings,
+            onValuesChanged = ::applyVrPanelSettings,
+            onCloseRequested = { setVrSettingsPanelVisible(false) },
+        )
         bridgeServer.onHaptic = { hand, amplitude, durationNs, frequency ->
             val handle = nativeXrHandle
             if (handle != 0L) {
@@ -192,17 +197,6 @@ class QuestVrActivity : ComponentActivity() {
         bridgeServer.onDiagnosticEvent = { event ->
             pendingBridgeMilestone = event
             XrLaunchDiagnostics.record(this, event)
-        }
-        QuestVrMenuBridge.setVisibilityListener { visible ->
-            vrQuickMenuVisible = visible
-            if (visible) {
-                startVrMenuCapture()
-            } else {
-                stopVrMenuCapture()
-                resetVrMenuNavigation()
-            }
-            val handle = nativeXrHandle
-            if (handle != 0L) nativeSetMenuVisible(handle, visible)
         }
         bridgeServer.start()
         var startupError: String? = null
@@ -232,8 +226,8 @@ class QuestVrActivity : ComponentActivity() {
             var launchError by rememberSaveable { mutableStateOf(startupError) }
             var launchStage by rememberSaveable { mutableStateOf("Starting Wine") }
             var stallWarning by rememberSaveable { mutableStateOf<String?>(null) }
-            LaunchedEffect(Unit) {
-                while (true) {
+            LaunchedEffect(launchError) {
+                while (launchError == null && launchStage != STEREO_ACTIVE_STAGE) {
                     pendingBridgeMilestone?.let { milestone ->
                         pendingBridgeMilestone = null
                         launchStage = milestone
@@ -245,7 +239,7 @@ class QuestVrActivity : ComponentActivity() {
                 stallWarning = null
                 if (launchError == null &&
                     !launchStage.startsWith("Windows process exited") &&
-                    launchStage != "Stereo projection active: game images displayed"
+                    launchStage != STEREO_ACTIVE_STAGE
                 ) {
                     val watchedStage = launchStage
                     delay(120_000)
@@ -273,7 +267,9 @@ class QuestVrActivity : ComponentActivity() {
                             testGraphics = testGraphics,
                             isOffline = isOffline,
                             launchInfoOverride = launchInfoOverride,
-                            registerBackAction = { action -> vrQuickMenuToggle = action },
+                            // The Quest activity owns a dedicated hand-attached menu. Do not
+                            // connect the flat Compose quick-menu toggle in VR sessions.
+                            registerBackAction = { _ -> },
                             navigateBack = {
                                 XrLaunchDiagnostics.record(this, "VR screen requested navigation back")
                                 if (!launchFailurePending) finish()
@@ -327,8 +323,8 @@ class QuestVrActivity : ComponentActivity() {
         bridgeServer.onHaptic = null
         bridgeServer.onRequestExit = null
         bridgeServer.onDiagnosticEvent = null
-        QuestVrMenuBridge.setVisibilityListener(null)
-        vrQuickMenuToggle = null
+        vrSettingsPanelRenderer?.close()
+        vrSettingsPanelRenderer = null
         if (nativeXrHandle != 0L) {
             nativeStop(nativeXrHandle)
             nativeXrHandle = 0
@@ -348,6 +344,7 @@ class QuestVrActivity : ComponentActivity() {
     private fun onNativeXrSurfaceReady(surface: Surface, width: Int, height: Int) {
         Timber.i("GameNativeVR native surface ready: ${width}x$height")
         runOnUiThread {
+            QuestVrSurfaceRegistry.setPresentationSuspended(false)
             QuestVrSurfaceRegistry.setSurface(surface, width, height)
         }
     }
@@ -384,11 +381,16 @@ class QuestVrActivity : ComponentActivity() {
         val previousButtons = lastVrButtons[hand]
         lastVrButtons[hand] = buttons
         if (hand == 0 && buttons and VR_BUTTON_MENU != 0 && previousButtons and VR_BUTTON_MENU == 0) {
-            runOnUiThread { vrQuickMenuToggle?.invoke() }
+            runOnUiThread { setVrSettingsPanelVisible(!vrQuickMenuVisible) }
         }
 
         if (vrQuickMenuVisible) {
-            if (hand == 1) handleVrMenuNavigation(buttons, previousButtons, data)
+            if (hand == 1 &&
+                buttons and VR_BUTTON_SECONDARY != 0 &&
+                previousButtons and VR_BUTTON_SECONDARY == 0
+            ) {
+                runOnUiThread { setVrSettingsPanelVisible(false) }
+            }
             val neutral = neutralVrMenuInput[hand]
             // Keep pose tracking continuous while withholding menu navigation,
             // trigger and stick input from the Windows game.
@@ -413,74 +415,9 @@ class QuestVrActivity : ComponentActivity() {
         }
     }
 
-    private fun handleVrMenuNavigation(buttons: Int, previousButtons: Int, data: FloatArray) {
-        val primaryPressed = buttons and VR_BUTTON_PRIMARY != 0
-        val primaryWasPressed = previousButtons and VR_BUTTON_PRIMARY != 0
-        val secondaryPressed = buttons and VR_BUTTON_SECONDARY != 0
-        val secondaryWasPressed = previousButtons and VR_BUTTON_SECONDARY != 0
-        val triggerPressed = data.getOrElse(0) { 0.0f } >= VR_MENU_TRIGGER_THRESHOLD
-
-        if ((primaryPressed && !primaryWasPressed) ||
-            (triggerPressed && !lastVrMenuTriggerPressed)
-        ) {
-            dispatchVrMenuKey(KeyEvent.KEYCODE_BUTTON_A)
-        }
-        if (secondaryPressed && !secondaryWasPressed) {
-            runOnUiThread { vrQuickMenuToggle?.invoke() }
-        }
-        lastVrMenuTriggerPressed = triggerPressed
-
-        val stickX = data.getOrElse(2) { 0.0f }
-        val stickY = data.getOrElse(3) { 0.0f }
-        val direction = when {
-            stickY >= VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_UP
-            stickY <= -VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_DOWN
-            stickX <= -VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_LEFT
-            stickX >= VR_MENU_STICK_THRESHOLD -> KeyEvent.KEYCODE_DPAD_RIGHT
-            else -> 0
-        }
-        val now = SystemClock.uptimeMillis()
-        when {
-            direction == 0 -> {
-                lastVrMenuDirection = 0
-                nextVrMenuRepeatAtMs = 0L
-            }
-            direction != lastVrMenuDirection -> {
-                dispatchVrMenuKey(direction)
-                lastVrMenuDirection = direction
-                nextVrMenuRepeatAtMs = now + VR_MENU_INITIAL_REPEAT_DELAY_MS
-            }
-            now >= nextVrMenuRepeatAtMs -> {
-                dispatchVrMenuKey(direction)
-                nextVrMenuRepeatAtMs = now + VR_MENU_REPEAT_INTERVAL_MS
-            }
-        }
-    }
-
-    private fun dispatchVrMenuKey(keyCode: Int) {
-        runOnUiThread {
-            val eventTime = SystemClock.uptimeMillis()
-            val down = KeyEvent(
-                eventTime,
-                eventTime,
-                KeyEvent.ACTION_DOWN,
-                keyCode,
-                0,
-                0,
-                KeyCharacterMap.VIRTUAL_KEYBOARD,
-                0,
-                0,
-                InputDevice.SOURCE_GAMEPAD,
-            )
-            dispatchKeyEvent(down)
-            dispatchKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP))
-        }
-    }
-
-    private fun resetVrMenuNavigation() {
-        lastVrMenuDirection = 0
-        nextVrMenuRepeatAtMs = 0L
-        lastVrMenuTriggerPressed = false
+    @Suppress("unused")
+    private fun onNativeVrMenuPointer(x: Float, y: Float, active: Boolean, select: Boolean) {
+        vrSettingsPanelRenderer?.updatePointer(x, y, active, select)
     }
 
     @Suppress("unused")
@@ -525,75 +462,94 @@ class QuestVrActivity : ComponentActivity() {
 
     @Suppress("unused")
     private fun createNativeVrMenuSurfaceTexture(textureId: Int, width: Int, height: Int): SurfaceTexture? {
-        Timber.i("Creating GameNativeVR menu SurfaceTexture: texture=$textureId ${width}x$height")
-        // This callback runs on the native XR thread. Do not stop the UI-thread
-        // capture runnable here: it was deliberately started just before native
-        // resource creation and will publish the first frame on its next tick.
+        Timber.i("Creating dedicated GameNativeVR settings SurfaceTexture: texture=$textureId ${width}x$height")
         vrMenuRenderSurface?.release()
         vrMenuSurfaceTexture?.release()
         return runCatching {
             SurfaceTexture(textureId).also { texture ->
                 texture.setDefaultBufferSize(width, height)
                 vrMenuSurfaceTexture = texture
-                vrMenuRenderSurface = Surface(texture)
+                Surface(texture).also { surface ->
+                    vrMenuRenderSurface = surface
+                    vrSettingsPanelRenderer?.attachSurface(surface, width, height)
+                }
             }
         }.onFailure { error ->
-            Timber.e(error, "Failed to create GameNativeVR menu SurfaceTexture")
+            Timber.e(error, "Failed to create dedicated GameNativeVR settings SurfaceTexture")
         }.getOrNull()
     }
 
-    private fun startVrMenuCapture() {
-        val decor = window.decorView
-        decor.removeCallbacks(vrMenuCaptureRunnable)
-        captureVrMenuFrame()
-        decor.postDelayed(vrMenuCaptureRunnable, VR_MENU_CAPTURE_INTERVAL_MS)
-    }
-
-    private fun stopVrMenuCapture() {
-        window.decorView.removeCallbacks(vrMenuCaptureRunnable)
-    }
-
-    private fun captureVrMenuFrame() {
-        val surface = vrMenuRenderSurface ?: return
-        val decor = window.decorView
-        if (!surface.isValid || decor.width <= 0 || decor.height <= 0) return
-
-        var canvas: android.graphics.Canvas? = null
-        try {
-            canvas = surface.lockHardwareCanvas()
-            canvas.drawColor(android.graphics.Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-            val saveCount = canvas.save()
-            canvas.scale(
-                VR_MENU_SURFACE_WIDTH.toFloat() / decor.width.toFloat(),
-                VR_MENU_SURFACE_HEIGHT.toFloat() / decor.height.toFloat(),
-            )
-            decor.draw(canvas)
-            canvas.restoreToCount(saveCount)
-        } catch (error: Exception) {
-            Timber.w(error, "Could not capture VR quick menu frame")
-        } finally {
-            if (canvas != null) {
-                runCatching { surface.unlockCanvasAndPost(canvas) }
-                    .onFailure { error -> Timber.w(error, "Could not publish VR quick menu frame") }
-            }
-        }
-    }
-
     private fun releaseVrMenuSurface() {
-        stopVrMenuCapture()
         releaseNativeVrMenuSurface()
     }
 
     @Suppress("unused")
     private fun releaseNativeVrMenuSurface() {
+        vrSettingsPanelRenderer?.detachSurface()
         vrMenuRenderSurface?.release()
         vrMenuRenderSurface = null
         vrMenuSurfaceTexture?.release()
         vrMenuSurfaceTexture = null
     }
 
+    private fun setVrSettingsPanelVisible(visible: Boolean) {
+        if (vrQuickMenuVisible == visible) return
+        vrQuickMenuVisible = visible
+        vrSettingsPanelRenderer?.setVisible(visible)
+        val handle = nativeXrHandle
+        if (handle != 0L) nativeSetMenuVisible(handle, visible)
+        XrLaunchDiagnostics.record(
+            this,
+            if (visible) "Left-hand VR settings panel opened" else "Left-hand VR settings panel closed",
+        )
+    }
+
+    @Suppress("unused")
+    private fun onNativeXrStereoPresentationChanged(active: Boolean) {
+        runOnUiThread {
+            QuestVrSurfaceRegistry.setPresentationSuspended(active)
+            val state = if (active) "suspended" else "resumed"
+            Timber.i("GameNativeVR flat X-server presentation $state")
+            XrLaunchDiagnostics.record(this, "Flat X-server presentation $state")
+        }
+    }
+
+    private fun applyVrPanelSettings(next: XrContainerSettings.Values) {
+        val previous = xrContainerSettings
+        xrContainerSettings = next
+        val persisted = XrContainerSettings.persist(applicationContext, vrAppId, next)
+        bridgeServer.setFramePacingDivisor(next.framePacingDivisor)
+        val handle = nativeXrHandle
+        if (handle != 0L) {
+            nativeSetRuntimeSettings(
+                handle,
+                next.theaterScreenEnabled,
+                next.clockEnabled,
+            )
+        }
+        vrSettingsPanelRenderer?.updateValues(next)
+        val changed = buildList {
+            if (previous.renderScale != next.renderScale) add("renderScale=${next.renderScale}% (next launch)")
+            if (previous.framePacingDivisor != next.framePacingDivisor) {
+                add("framePacing=${next.framePacingDivisor}:1 (live)")
+            }
+            if (previous.openCompositeEnabled != next.openCompositeEnabled) {
+                add("openComposite=${next.openCompositeEnabled} (next launch)")
+            }
+            if (previous.theaterScreenEnabled != next.theaterScreenEnabled) {
+                add("theater=${next.theaterScreenEnabled} (live)")
+            }
+            if (previous.clockEnabled != next.clockEnabled) add("clock=${next.clockEnabled} (live)")
+        }
+        XrLaunchDiagnostics.record(
+            this,
+            "VR panel settings changed: ${changed.joinToString().ifBlank { "none" }} persisted=$persisted",
+        )
+    }
+
     private fun releaseXrRenderSurface() {
         QuestVrSurfaceRegistry.clearSurface()
+        QuestVrSurfaceRegistry.setPresentationSuspended(false)
         xrRenderSurface?.release()
         xrRenderSurface = null
         xrSurfaceTexture?.release()
@@ -706,16 +662,9 @@ class QuestVrActivity : ComponentActivity() {
     }
 
     companion object {
-        private const val VR_BUTTON_PRIMARY = 1
+        private const val STEREO_ACTIVE_STAGE = "Stereo projection active: game images displayed"
         private const val VR_BUTTON_SECONDARY = 2
         private const val VR_BUTTON_MENU = 8
-        private const val VR_MENU_TRIGGER_THRESHOLD = 0.72f
-        private const val VR_MENU_STICK_THRESHOLD = 0.55f
-        private const val VR_MENU_INITIAL_REPEAT_DELAY_MS = 360L
-        private const val VR_MENU_REPEAT_INTERVAL_MS = 110L
-        private const val VR_MENU_CAPTURE_INTERVAL_MS = 33L
-        private const val VR_MENU_SURFACE_WIDTH = 1920
-        private const val VR_MENU_SURFACE_HEIGHT = 1080
 
         init {
             if (Build.BRAND.equals("oculus", ignoreCase = true)) {
@@ -738,6 +687,11 @@ class QuestVrActivity : ComponentActivity() {
     private external fun nativeHaptic(handle: Long, hand: Int, amplitude: Float, durationNs: Long, frequency: Float)
     private external fun nativeRequestExit(handle: Long)
     private external fun nativeSetMenuVisible(handle: Long, visible: Boolean)
+    private external fun nativeSetRuntimeSettings(
+        handle: Long,
+        theaterScreenEnabled: Boolean,
+        clockEnabled: Boolean,
+    )
 }
 
 private fun android.content.Intent.toLaunchInfoOverride(): LaunchInfo? {
@@ -764,8 +718,15 @@ private fun QuestVrTheaterScreen(
     onReturn: () -> Unit,
     content: @Composable () -> Unit,
 ) {
-    val diagnostics by produceState(initialValue = statusProvider()) {
-        while (true) {
+    val stereoActive = launchStage == "Stereo projection active: game images displayed"
+    val diagnostics by produceState(
+        initialValue = statusProvider(),
+        key1 = stereoActive,
+        key2 = launchError,
+    ) {
+        // The flat activity is hidden behind the headset compositor after stereo starts.
+        // Continuing to poll and recompose it once per second only steals UI/GC time from VR.
+        while (!stereoActive || launchError != null) {
             value = statusProvider()
             delay(1_000)
         }

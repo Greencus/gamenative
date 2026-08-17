@@ -157,7 +157,7 @@ class XrBridgeServer {
             onDiagnosticEvent?.invoke("OpenXR bridge connected")
             while (running.get()) {
                 val line = reader.readLine() ?: break
-                val response = handleCommand(line.trim())
+                val response = handleCommand(line)
                 writer.write(response)
                 writer.write('\n'.code)
                 writer.flush()
@@ -170,10 +170,10 @@ class XrBridgeServer {
     }
 
     private fun handleCommand(command: String): String {
-        if (command != "WAIT_FRAME" && command != "LOCATE_VIEWS" &&
-            !command.startsWith("GET_INPUT") && !command.startsWith("BEGIN_FRAME") &&
-            !command.startsWith("END_FRAME")
-        ) {
+        val hotCommand = command == "WAIT_FRAME" || command == "LOCATE_VIEWS" ||
+            command.startsWith("GET_INPUT") || command == "BEGIN_FRAME" ||
+            command.startsWith("END_FRAME")
+        if (!hotCommand) {
             lastCommand = command
         }
         val response = when {
@@ -243,7 +243,10 @@ class XrBridgeServer {
                 "ERR unknown_command"
             }
         }
-        publishStatus()
+        // WAIT_FRAME / LOCATE_VIEWS / GET_INPUT are the hot game-frame protocol. Updating
+        // diagnostic state there used to perform a clock read and atomic CAS for every
+        // command, then allocate a status string four times per second even when hidden.
+        if (!hotCommand) publishStatus()
         return response
     }
 
@@ -371,11 +374,30 @@ class XrBridgeServer {
 
     private fun parseInt(command: String, key: String): Int? = parseLong(command, key)?.toInt()
 
-    private fun parseLong(command: String, key: String): Long? =
-        command.splitToSequence(' ')
-            .firstOrNull { it.startsWith("$key=") }
-            ?.substringAfter('=')
-            ?.toLongOrNull()
+    private fun parseLong(command: String, key: String): Long? {
+        val token = "$key="
+        var start = command.indexOf(token)
+        while (start >= 0 && start > 0 && command[start - 1] != ' ') {
+            start = command.indexOf(token, start + token.length)
+        }
+        if (start < 0) return null
+        var cursor = start + token.length
+        var negative = false
+        if (cursor < command.length && command[cursor] == '-') {
+            negative = true
+            cursor++
+        }
+        if (cursor >= command.length || command[cursor] !in '0'..'9') return null
+        var value = 0L
+        while (cursor < command.length) {
+            val character = command[cursor]
+            if (character == ' ') break
+            if (character !in '0'..'9') return null
+            value = value * 10L + (character - '0')
+            cursor++
+        }
+        return if (negative) -value else value
+    }
 
     companion object {
         const val HOST = "127.0.0.1"

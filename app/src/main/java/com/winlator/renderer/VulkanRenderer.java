@@ -65,6 +65,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     private Drawable rootCursorDrawable;
     private Cursor lastCursor = null;
     private boolean xRenderingPausedForScanout = false;
+    private volatile boolean presentationSuspended = false;
 
     private volatile ArrayList<RenderableWindow> renderableWindows = new ArrayList<>();
     private static final java.util.concurrent.atomic.AtomicLong ID_GEN =
@@ -137,6 +138,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     }
 
     public void queueSceneUpdate() {
+        if (presentationSuspended) return;
         if (scenePending.compareAndSet(false, true)) {
             xServerView.queueEvent(() -> {
                 scenePending.set(false);
@@ -332,6 +334,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     }
 
     public void updateScene() {
+        if (presentationSuspended) return;
         ArrayList<RenderableWindow> newList = new ArrayList<>();
         try (XLock xl = xServer.lock(XServer.Lockable.WINDOW_MANAGER, XServer.Lockable.DRAWABLE_MANAGER)) {
             collectWindows(newList, xServer.windowManager.rootWindow,
@@ -432,6 +435,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     }
 
     public void onUpdateWindowContentDirect(Window window, Drawable pixmap, short xOff, short yOff) {
+        if (presentationSuspended) return;
         if (hudRef != null && !nativeMode) hudRef.update();
         if (nativeHandle == 0 || pixmap == null) return;
         Drawable targetDrawable = window.getContent();
@@ -473,6 +477,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
 
     @Override
     public void onUpdateWindowContent(Window window) {
+        if (presentationSuspended) return;
         if (hudRef != null) hudRef.update();
         final long handle;
         synchronized (lock) { handle = nativeHandle; }
@@ -529,6 +534,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
 
     @Override
     public void onPointerMove(short x, short y) {
+        if (presentationSuspended) return;
         synchronized (lock) {
             if (nativeHandle == 0) return;
             nativeSetPointerPos(nativeHandle, x, y);
@@ -546,6 +552,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
 
     @Override
     public void onDestroyWindow(Window window) {
+        if (presentationSuspended) return;
         final long id = did(window.getContent());
         xServerView.queueEvent(() -> {
             synchronized (lock) { if (nativeHandle != 0) nativeRemoveWindow(nativeHandle, id); }
@@ -557,6 +564,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
 
     @Override
     public void onUnmapWindow(Window window) {
+        if (presentationSuspended) return;
         final long id = did(window.getContent());
         xServerView.queueEvent(() -> {
             synchronized (lock) { if (nativeHandle != 0) nativeRemoveWindow(nativeHandle, id); }
@@ -583,6 +591,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
 
     public void setCursorVisible(boolean visible) {
         cursorVisible = visible;
+        if (presentationSuspended) return;
         synchronized (lock) {
             if (nativeHandle != 0) { nativeSetCursorVisible(nativeHandle, visible); if (visible) sendCursorToNative(lastCursor); }
         }
@@ -596,6 +605,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
      * without necessarily changing the XServer pointer state.
      */
     public void updateVisualCursorPosition(int x, int y) {
+        if (presentationSuspended) return;
         synchronized (lock) {
             if (nativeHandle == 0) return;
             nativeSetPointerPos(nativeHandle, (short) x, (short) y);
@@ -677,6 +687,21 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     }
 
     public boolean isNativeMode() { return nativeMode; }
+
+    /**
+     * Stops flat-desktop uploads and scene work while true OpenXR stereo is active.
+     * Surface detach/reattach is owned by XrXServerView; this gate prevents X window
+     * damage callbacks from continuing to allocate command work against the detached
+     * Vulkan compositor.
+     */
+    public void setPresentationSuspended(boolean suspended) {
+        presentationSuspended = suspended;
+        if (suspended) {
+            scenePending.set(false);
+        }
+    }
+
+    public boolean isPresentationSuspended() { return presentationSuspended; }
 
     public void setDriverInfo(String driverPath, String libraryName, String nativeLibDir) {
         this.driverPath = driverPath;

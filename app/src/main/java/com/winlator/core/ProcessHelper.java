@@ -9,24 +9,27 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
-import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 public abstract class ProcessHelper {
-    public static final boolean PRINT_DEBUG = true; // FIXME change to false
-    private static final ArrayList<Callback<String>> debugCallbacks = new ArrayList<>();
+    // Process stdout can contain tens of thousands of Wine/Box64 lines. Mirroring it to
+    // logcat adds a second formatting/write path and causes visible scheduling jitter on
+    // the same CPU cluster as the game. Explicit diagnostic callbacks still receive it.
+    public static final boolean PRINT_DEBUG = false;
+    // Reads happen for every process-output line while writes only happen at launch/teardown.
+    // Copy-on-write keeps the pipe drainers lock-free without allocating a snapshot per line.
+    private static final CopyOnWriteArrayList<Callback<String>> debugCallbacks =
+        new CopyOnWriteArrayList<>();
     private static final byte SIGCONT = 18;
     private static final byte SIGSTOP = 19;
     private static final byte SIGTERM = 15;
@@ -105,10 +108,8 @@ public abstract class ProcessHelper {
             suspendProcess(Integer.parseInt(pid));
         }
 
-        // Verify + retry on a background thread — never block the caller (may be the main thread).
-        //noinspection resource — shutdown() is called after execute(); try-with-resources not available on Android Java 8
-        ExecutorService verifier = Executors.newSingleThreadExecutor();
-        verifier.execute(() -> {
+        // Verify and retry on a short-lived daemon thread; never block the caller.
+        Thread verifier = new Thread(() -> {
             // Give the kernel 50 ms to deliver SIGSTOP before reading /proc status.
             try { Thread.sleep(50); } catch (InterruptedException ignored) {}
 
@@ -135,8 +136,9 @@ public abstract class ProcessHelper {
                     }
                 }
             }
-        });
-        verifier.shutdown(); // no new tasks; existing task runs to completion
+        }, "wine-pause-verifier");
+        verifier.setDaemon(true);
+        verifier.start();
     }
 
     private static boolean isProcessStopped(int pid) {
@@ -206,9 +208,7 @@ public abstract class ProcessHelper {
         try {
             if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
 
-            if (BuildConfig.DEBUG) {
-                Log.d("ProcessHelper", "Executing with output: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
-            }
+            if (BuildConfig.DEBUG) Log.d("ProcessHelper", "Executing command with captured output");
 
             ProcessBuilder pb = new ProcessBuilder(splitCommand(command));
             Map<String, String> env = pb.environment();
@@ -306,9 +306,7 @@ public abstract class ProcessHelper {
         try {
             if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
 
-            if (BuildConfig.DEBUG) {
-                Log.d("ProcessHelper", "Executing: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
-            }
+            if (BuildConfig.DEBUG) Log.d("ProcessHelper", "Starting guest process");
 
             process = Runtime.getRuntime().exec(splitCommand(command), envp, workingDir);
 
@@ -342,9 +340,7 @@ public abstract class ProcessHelper {
         try {
             if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
 
-            if (BuildConfig.DEBUG) {
-                Log.d("ProcessHelper", "Executing: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
-            }
+            if (BuildConfig.DEBUG) Log.d("ProcessHelper", "Starting managed guest process");
 
             java.lang.Process process = Runtime.getRuntime().exec(splitCommand(command), envp, workingDir);
             createDebugThread(process.getInputStream());
@@ -417,15 +413,38 @@ public abstract class ProcessHelper {
 
     private static void createDebugThread(final InputStream inputStream) {
         Thread drainThread = new Thread(() -> {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    synchronized (debugCallbacks) {
-                        if (!debugCallbacks.isEmpty()) {
+            try (InputStreamReader reader = new InputStreamReader(inputStream)) {
+                char[] buffer = new char[8192];
+                StringBuilder pendingLine = null;
+                int count;
+                while ((count = reader.read(buffer)) != -1) {
+                    // Most launches do not capture Wine output. Drain whole chunks without
+                    // constructing one Java String per guest log line in that common case.
+                    if (debugCallbacks.isEmpty() && !PRINT_DEBUG) {
+                        pendingLine = null;
+                        continue;
+                    }
+                    if (pendingLine == null) pendingLine = new StringBuilder(256);
+                    for (int i = 0; i < count; i++) {
+                        char value = buffer[i];
+                        if (value == '\n') {
+                            int length = pendingLine.length();
+                            if (length > 0 && pendingLine.charAt(length - 1) == '\r') {
+                                pendingLine.setLength(length - 1);
+                            }
+                            String line = pendingLine.toString();
                             if (PRINT_DEBUG) System.out.println(line);
-                            for (Callback<String> callback : debugCallbacks) callback.call(line);
+                            dispatchDebugLine(line);
+                            pendingLine.setLength(0);
+                        } else if (pendingLine.length() < 65536) {
+                            pendingLine.append(value);
                         }
                     }
+                }
+                if (pendingLine != null && pendingLine.length() != 0) {
+                    String line = pendingLine.toString();
+                    if (PRINT_DEBUG) System.out.println(line);
+                    dispatchDebugLine(line);
                 }
             }
             catch (java.io.InterruptedIOException e) {
@@ -440,7 +459,7 @@ public abstract class ProcessHelper {
     }
 
     private static void createDebugThread(final InputStream inputStream, final String streamType, final int pid) {
-        Executors.newSingleThreadExecutor().execute(() -> {
+        Thread debugThread = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
@@ -453,20 +472,18 @@ public abstract class ProcessHelper {
                     }
 
                     if (PRINT_DEBUG) System.out.println(line);
-                    synchronized (debugCallbacks) {
-                        if (!debugCallbacks.isEmpty()) {
-                            for (Callback<String> callback : debugCallbacks) callback.call(line);
-                        }
-                    }
+                    dispatchDebugLine(line);
                 }
             }
             catch (IOException e) {}
-        });
+        }, "process-output-debug");
+        debugThread.setDaemon(true);
+        debugThread.start();
     }
 
 
     private static void createWaitForThread(java.lang.Process process, final Callback<Integer> terminationCallback) {
-        Executors.newSingleThreadExecutor().execute(new Runnable() {
+        Thread waitThread = new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -477,25 +494,43 @@ public abstract class ProcessHelper {
                     Log.e("ProcessHelper", "Error waiting for process termination", e);
                 }
             }
-        });
+        }, "process-exit-waiter");
+        waitThread.setDaemon(true);
+        waitThread.start();
+    }
+
+    private static void dispatchDebugLine(String line) {
+        for (Callback<String> callback : debugCallbacks) {
+            try {
+                callback.call(line);
+            } catch (RuntimeException e) {
+                Log.e("ProcessHelper", "Debug callback failed", e);
+            }
+        }
+    }
+
+    private static void closeDebugCallback(Callback<String> callback) {
+        if (!(callback instanceof AutoCloseable)) return;
+        try {
+            ((AutoCloseable)callback).close();
+        } catch (Exception e) {
+            Log.w("ProcessHelper", "Could not close debug callback", e);
+        }
     }
 
     public static void removeAllDebugCallbacks() {
-        synchronized (debugCallbacks) {
-            debugCallbacks.clear();
-        }
+        Callback<String>[] removed = debugCallbacks.toArray(new Callback[0]);
+        debugCallbacks.clear();
+        for (Callback<String> callback : removed) closeDebugCallback(callback);
     }
 
     public static void addDebugCallback(Callback<String> callback) {
-        synchronized (debugCallbacks) {
-            if (!debugCallbacks.contains(callback)) debugCallbacks.add(callback);
-        }
+        debugCallbacks.addIfAbsent(callback);
     }
 
     public static void removeDebugCallback(Callback<String> callback) {
-        synchronized (debugCallbacks) {
-            debugCallbacks.remove(callback);
-        }
+        boolean removed = debugCallbacks.remove(callback);
+        if (removed) closeDebugCallback(callback);
     }
 
     public static String[] splitCommand(String command) {
@@ -585,32 +620,34 @@ public abstract class ProcessHelper {
 
     public static ArrayList<String> listRunningWineProcesses(){
         File proc = new File("/proc");
-        String[] filters = {"wine", "exe"};
-        String[] allPids;
-        ArrayList<String> filteredPids = new ArrayList<String>();
-        List<String> filterList = Arrays.asList(filters);
-        allPids = proc.list(new FilenameFilter(){
-            public boolean accept(File proc, String filename){
-                return new File(proc, filename).isDirectory() && filename.matches("[0-9]+");
-            }
-        });
+        String[] allPids = proc.list((dir, filename) -> isNumeric(filename));
+        ArrayList<String> filteredPids = new ArrayList<>();
+        if (allPids == null) return filteredPids;
 
         String procFile = "/cmdline";
-        for (int index = 0; index < allPids.length; index++){
+        for (String pid : allPids) {
             String data = "";
             try (
-                FileInputStream fr = new FileInputStream(proc + "/" + allPids[index] + procFile);
+                FileInputStream fr = new FileInputStream(proc + "/" + pid + procFile);
                 BufferedReader br = new BufferedReader(new InputStreamReader(fr));
             ) {
                 String line = br.readLine();
                 if (line != null) data = line;
             }
             catch (IOException e) {}
-            for (String filter : filterList) {
-                if (data.contains(filter))
-                    filteredPids.add(allPids[index]);
-            }
+            // Add each PID at most once. The old nested filter loop duplicated most
+            // Wine processes because their command line usually contains both strings.
+            if (data.contains("wine") || data.contains("exe")) filteredPids.add(pid);
         }
         return filteredPids;
+    }
+
+    private static boolean isNumeric(String value) {
+        if (value == null || value.isEmpty()) return false;
+        for (int i = 0; i < value.length(); ++i) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
     }
 }

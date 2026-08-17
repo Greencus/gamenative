@@ -16,9 +16,16 @@ import com.winlator.xserver.Pointer;
 import com.winlator.xserver.XServer;
 
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 public class TouchMouse {
+    private static final ScheduledExecutorService RELEASE_EXECUTOR =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "touch-button-release");
+                thread.setDaemon(true);
+                return thread;
+            });
     private static final byte MAX_FINGERS = 4;
     private static final short MAX_TWO_FINGERS_SCROLL_DISTANCE = 350;
     public static final byte MAX_TAP_TRAVEL_DISTANCE = 10;
@@ -243,7 +250,7 @@ public class TouchMouse {
 
     private void releasePointerButtonLeft(final Finger finger) {
         if (pointerButtonLeftEnabled && finger == fingerPointerButtonLeft && xServer.pointer.isButtonPressed(Pointer.Button.BUTTON_LEFT)) {
-            Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+            RELEASE_EXECUTOR.schedule(() -> {
                 xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT);
                 fingerPointerButtonLeft = null;
             }, 30, TimeUnit.MILLISECONDS);
@@ -256,7 +263,7 @@ public class TouchMouse {
 
     private void releasePointerButtonRight(final Finger finger) {
         if (pointerButtonRightEnabled && finger == fingerPointerButtonRight && xServer.pointer.isButtonPressed(Pointer.Button.BUTTON_RIGHT)) {
-            Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+            RELEASE_EXECUTOR.schedule(() -> {
                 xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT);
                 fingerPointerButtonRight = null;
             }, 30, TimeUnit.MILLISECONDS);

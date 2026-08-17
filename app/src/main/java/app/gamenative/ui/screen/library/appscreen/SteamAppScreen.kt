@@ -1169,12 +1169,20 @@ class SteamAppScreen : BaseAppScreen() {
         }
 
         if (showVrLaunchDialog) {
+            // The screen-level [container] is remembered for the lifetime of this app screen.
+            // Container configuration is saved through a separately loaded Container instance,
+            // so using the remembered object here can overwrite the newly saved .container file
+            // with its stale snapshot when the launch-options dialog calls saveData(). Always
+            // load the current on-disk snapshot when this dialog enters the composition.
+            val dialogContainer = remember(gameId, showVrLaunchDialog) {
+                ContainerUtils.getContainer(context, libraryItem.appId)
+            }
             var selectedMode by remember(gameId) {
-                mutableStateOf(XrLaunchPreferences.mode(container))
+                mutableStateOf(XrLaunchPreferences.mode(dialogContainer))
             }
             var selectedLaunchIndex by remember(gameId) {
                 mutableIntStateOf(
-                    XrLaunchPreferences.selectedSteamLaunchIndex(container)
+                    XrLaunchPreferences.selectedSteamLaunchIndex(dialogContainer)
                         .takeIf { it in launchInfos.indices }
                         ?: launchInfos.indexOfFirst(XrLaunchPreferences::isVrLaunchInfo)
                             .takeIf { it >= 0 }
@@ -1183,13 +1191,13 @@ class SteamAppScreen : BaseAppScreen() {
                 )
             }
             var customArgs by remember(gameId) {
-                mutableStateOf(XrLaunchPreferences.customArgs(container))
+                mutableStateOf(XrLaunchPreferences.customArgs(dialogContainer))
             }
             var promptEveryLaunch by remember(gameId) {
-                mutableStateOf(XrLaunchPreferences.shouldPromptEveryLaunch(container))
+                mutableStateOf(XrLaunchPreferences.shouldPromptEveryLaunch(dialogContainer))
             }
             var openCompositeEnabled by remember(gameId) {
-                mutableStateOf(XrRuntimeManager.isOpenCompositeEnabled(context, container))
+                mutableStateOf(XrRuntimeManager.isOpenCompositeEnabled(context, dialogContainer))
             }
             val launchAfterSave = shouldLaunchAfterVrDialogSave(gameId)
 
@@ -1271,13 +1279,14 @@ class SteamAppScreen : BaseAppScreen() {
                     TextButton(
                         onClick = {
                             XrLaunchPreferences.save(
-                                container = container,
+                                context = context,
+                                appId = libraryItem.appId,
                                 mode = selectedMode,
                                 steamLaunchIndex = selectedLaunchIndex,
                                 customArgs = customArgs,
                                 promptEveryLaunch = promptEveryLaunch,
                             )
-                            XrRuntimeManager.setOpenCompositeEnabled(context, container, openCompositeEnabled)
+                            XrRuntimeManager.setOpenCompositeEnabled(context, libraryItem.appId, openCompositeEnabled)
                             hideVrLaunchDialog(gameId)
                             if (launchAfterSave) {
                                 onClickPlay(false)

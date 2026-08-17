@@ -11,13 +11,22 @@ import com.winlator.widget.XServerRendererView;
 import com.winlator.xserver.XServer;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 @SuppressLint("ViewConstructor")
 public class XrXServerView extends View implements XServerRendererView, QuestVrSurfaceRegistry.Listener {
     private final VulkanRenderer renderer;
     private final XServer xServer;
-    private final ExecutorService eventExecutor = Executors.newSingleThreadExecutor();
+    // The renderer event queue is normally idle once setup finishes. Let its worker
+    // retire instead of pinning a thread and stack for the lifetime of the VR activity.
+    private final ExecutorService eventExecutor = new ThreadPoolExecutor(
+            0, 1, 5, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                Thread thread = new Thread(r, "xr-render-events");
+                thread.setDaemon(true);
+                return thread;
+            });
     private int frameRateLimit = 0;
     private boolean hasSurface = false;
 
@@ -51,6 +60,7 @@ public class XrXServerView extends View implements XServerRendererView, QuestVrS
             if (hasSurface) {
                 renderer.onSurfaceDestroyed();
             }
+            renderer.setPresentationSuspended(false);
             renderer.onSurfaceCreated(target.getSurface());
             renderer.onSurfaceChanged(target.getWidth(), target.getHeight());
             hasSurface = true;
@@ -60,6 +70,7 @@ public class XrXServerView extends View implements XServerRendererView, QuestVrS
     @Override
     public void onXrSurfaceDestroyed() {
         post(() -> {
+            renderer.setPresentationSuspended(true);
             if (hasSurface) {
                 renderer.onSurfaceDestroyed();
                 hasSurface = false;
@@ -92,6 +103,6 @@ public class XrXServerView extends View implements XServerRendererView, QuestVrS
     }
 
     public void requestRender() {
-        renderer.queueSceneUpdate();
+        if (hasSurface) renderer.queueSceneUpdate();
     }
 }

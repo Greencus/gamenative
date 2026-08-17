@@ -24,6 +24,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -125,7 +126,11 @@ public:
           activityRef(activity),
           renderScalePercent(std::clamp(renderScalePercent, 50, 150)),
           theaterScreenEnabled(theaterScreenEnabled),
-          clockEnabled(clockEnabled) {}
+          clockEnabled(clockEnabled),
+          appliedTheaterRequest(theaterScreenEnabled),
+          appliedClockRequest(clockEnabled),
+          requestedTheaterScreenEnabled(theaterScreenEnabled),
+          requestedClockEnabled(clockEnabled) {}
 
     ~QuestXrApp() {
         stop();
@@ -162,6 +167,11 @@ public:
         menuVisible.store(visible, std::memory_order_release);
     }
 
+    void setRuntimeSettings(bool theaterEnabled, bool clockEnabledValue) {
+        requestedTheaterScreenEnabled.store(theaterEnabled, std::memory_order_release);
+        requestedClockEnabled.store(clockEnabledValue, std::memory_order_release);
+    }
+
 private:
     JavaVM* javaVm{nullptr};
     jobject activityRef{nullptr};
@@ -172,6 +182,10 @@ private:
     int renderScalePercent{100};
     bool theaterScreenEnabled{true};
     bool clockEnabled{true};
+    bool appliedTheaterRequest{true};
+    bool appliedClockRequest{true};
+    std::atomic<bool> requestedTheaterScreenEnabled{true};
+    std::atomic<bool> requestedClockEnabled{true};
 
     EGLDisplay eglDisplay{EGL_NO_DISPLAY};
     EGLConfig eglConfig{nullptr};
@@ -193,12 +207,16 @@ private:
     jmethodID activityViewConfigMethod{nullptr};
     jmethodID activityOverlayReadyMethod{nullptr};
     jmethodID activityDiagnosticMethod{nullptr};
+    jmethodID activityMenuPointerMethod{nullptr};
+    jmethodID activityStereoPresentationMethod{nullptr};
     jfloatArray trackingArrayRef{nullptr};  // 22 eye floats + stage width/height
     jfloatArray inputArrayRef{nullptr};     // global ref, 18 floats (analogs + grip/aim poses)
 
     XrInstance instance{XR_NULL_HANDLE};
     XrSystemId systemId{XR_NULL_SYSTEM_ID};
     XrSession session{XR_NULL_HANDLE};
+    bool performanceSettingsEnabled{false};
+    PFN_xrPerfSettingsSetPerformanceLevelEXT setPerformanceLevel{nullptr};
     XrSpace appSpace{XR_NULL_HANDLE};
     XrSpace viewSpace{XR_NULL_HANDLE};
     XrSessionState sessionState{XR_SESSION_STATE_UNKNOWN};
@@ -212,10 +230,11 @@ private:
     std::vector<XrCompositionLayerProjectionView> compositionViews;
     std::vector<EyeSwapchain> eyeSwapchains;
     ScreenSwapchain screenSwapchain;
+    ScreenSwapchain menuSwapchain{XR_NULL_HANDLE, 1024, 1280, {}};
     ScreenSwapchain clockSwapchain{XR_NULL_HANDLE, 384, 160, {}};
 
-    // Zero-copy eye-buffer transport: the Wine producer ships per-eye AHardwareBuffers
-    // (the game's actual swapchain images) over an AF_UNIX socket. We import each into a
+    // GPU-only eye-buffer transport: the Wine producer copies each eye into shared
+    // AHardwareBuffers over Vulkan and ships their handles over an AF_UNIX socket. We import each into a
     // GL texture and blit it into the real Quest eye swapchain for a true stereo
     // projection layer. Until a producer connects this stays idle and the legacy theater
     // path below is used unchanged.
@@ -252,6 +271,10 @@ private:
     bool overlayReady{false};
     bool lastMenuVisible{false};
     bool menuScreenReady{false};
+    bool lastMenuPointerActive{false};
+    bool lastMenuTriggerPressed{false};
+    float lastMenuPointerX{-1.0f};
+    float lastMenuPointerY{-1.0f};
     int64_t renderedClockMinute{-1};
     GLuint eyeTextures[gamenative::xr::FrameTransport::kEyeCount]
                       [gamenative::xr::FrameTransport::kMaxImages]{};
@@ -275,6 +298,9 @@ private:
     bool stereoResourcesReady{false};
     bool stereoProjectionAnnounced{false};
     bool stereoMilestonePublished{false};
+    bool flatPresentationSuspended{false};
+    uint32_t consecutiveStereoMisses{0};
+    static constexpr uint32_t kStereoFallbackFrames = 36;
 
     void threadMain() {
         JNIEnv* env = nullptr;
@@ -293,7 +319,7 @@ private:
 
         LOGI("OpenXR frame loop started");
         while (running) {
-            pollEvents();
+            pollEvents(env);
             if (exitRequested.exchange(false) && session != XR_NULL_HANDLE && sessionRunning) {
                 XrResult result = xrRequestExitSession(session);
                 if (XR_FAILED(result)) {
@@ -412,6 +438,16 @@ private:
             activityClass,
             "onNativeXrDiagnostic",
             "(Ljava/lang/String;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        activityMenuPointerMethod = env->GetMethodID(
+            activityClass,
+            "onNativeVrMenuPointer",
+            "(FFZZ)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        activityStereoPresentationMethod = env->GetMethodID(
+            activityClass,
+            "onNativeXrStereoPresentationChanged",
+            "(Z)V");
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(activityClass);
 
@@ -550,7 +586,35 @@ private:
             XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
             XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
         };
-
+        uint32_t availableExtensionCount = 0;
+        const XrResult countResult = xrEnumerateInstanceExtensionProperties(
+            nullptr, 0, &availableExtensionCount, nullptr);
+        if (XR_SUCCEEDED(countResult) && availableExtensionCount > 0) {
+            std::vector<XrExtensionProperties> availableExtensions(availableExtensionCount);
+            for (auto& extension : availableExtensions) {
+                extension = {XR_TYPE_EXTENSION_PROPERTIES};
+            }
+            const XrResult enumerateResult = xrEnumerateInstanceExtensionProperties(
+                nullptr,
+                availableExtensionCount,
+                &availableExtensionCount,
+                availableExtensions.data());
+            if (XR_SUCCEEDED(enumerateResult)) {
+                for (const auto& extension : availableExtensions) {
+                    if (std::strcmp(
+                            extension.extensionName,
+                            XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME) == 0) {
+                        extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+                        performanceSettingsEnabled = true;
+                        break;
+                    }
+                }
+            } else {
+                LOGW("Unable to enumerate optional OpenXR extensions: %d", enumerateResult);
+            }
+        } else if (XR_FAILED(countResult)) {
+            LOGW("Unable to query optional OpenXR extensions: %d", countResult);
+        }
         XrApplicationInfo appInfo{};
         std::strncpy(appInfo.applicationName, "GameNativeVR", XR_MAX_APPLICATION_NAME_SIZE - 1);
         appInfo.applicationVersion = 1;
@@ -569,6 +633,22 @@ private:
         createInfo.enabledExtensionNames = extensions.data();
 
         XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+        if (performanceSettingsEnabled) {
+            const XrResult procResult = xrGetInstanceProcAddr(
+                instance,
+                "xrPerfSettingsSetPerformanceLevelEXT",
+                reinterpret_cast<PFN_xrVoidFunction*>(&setPerformanceLevel));
+            if (XR_FAILED(procResult) || setPerformanceLevel == nullptr) {
+                LOGW("XR_EXT_performance_settings was advertised but its function is unavailable: %d", procResult);
+                performanceSettingsEnabled = false;
+                setPerformanceLevel = nullptr;
+            } else {
+                LOGI("XR_EXT_performance_settings enabled");
+            }
+        } else {
+            LOGW("XR_EXT_performance_settings unavailable; using the runtime's default performance profile");
+        }
 
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -962,15 +1042,64 @@ private:
         screenSwapchain.images.clear();
     }
 
+    bool createMenuSwapchainImages() {
+        if (menuSwapchain.swapchain != XR_NULL_HANDLE) return true;
+        uint32_t formatCount = 0;
+        XR_CHECK(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr));
+        if (formatCount == 0) return false;
+        std::vector<int64_t> formats(formatCount);
+        XR_CHECK(xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()));
+
+        int64_t selectedFormat = formats[0];
+        for (int64_t format : formats) {
+            if (format == GL_RGBA8) {
+                selectedFormat = format;
+                break;
+            }
+        }
+
+        XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+            XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        createInfo.format = selectedFormat;
+        createInfo.sampleCount = 1;
+        createInfo.width = menuSwapchain.width;
+        createInfo.height = menuSwapchain.height;
+        createInfo.faceCount = 1;
+        createInfo.arraySize = 1;
+        createInfo.mipCount = 1;
+        XR_CHECK(xrCreateSwapchain(session, &createInfo, &menuSwapchain.swapchain));
+
+        uint32_t imageCount = 0;
+        XR_CHECK(xrEnumerateSwapchainImages(menuSwapchain.swapchain, 0, &imageCount, nullptr));
+        menuSwapchain.images.assign(
+            imageCount,
+            XrSwapchainImageOpenGLESKHR{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+        XR_CHECK(xrEnumerateSwapchainImages(
+            menuSwapchain.swapchain,
+            imageCount,
+            &imageCount,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(menuSwapchain.images.data())));
+        return true;
+    }
+
+    void destroyMenuSwapchain() {
+        if (menuSwapchain.swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(menuSwapchain.swapchain);
+            menuSwapchain.swapchain = XR_NULL_HANDLE;
+        }
+        menuSwapchain.images.clear();
+    }
+
     bool ensureMenuScreenResources(JNIEnv* env) {
-        if (!createScreenSwapchainImages()) return false;
+        if (!createMenuSwapchainImages()) return false;
         if (menuSurfaceTextureRef == nullptr && !createMenuExternalTextureSurface(env)) {
             destroyMenuExternalTextureSurface(env, false);
-            if (!theaterScreenEnabled) destroyScreenSwapchain();
+            destroyMenuSwapchain();
             return false;
         }
         if (blitProgram == 0 && !createBlitResources()) {
-            if (!theaterScreenEnabled) destroyScreenSwapchain();
+            destroyMenuSwapchain();
             return false;
         }
         return true;
@@ -1028,8 +1157,8 @@ private:
             activityRef,
             method,
             static_cast<jint>(menuExternalTexture),
-            screenSwapchain.width,
-            screenSwapchain.height);
+            menuSwapchain.width,
+            menuSwapchain.height);
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
             env->ExceptionClear();
@@ -1623,60 +1752,93 @@ void main() {
         }
 
         if (viewCount > eyeSwapchains.size()) viewCount = static_cast<uint32_t>(eyeSwapchains.size());
+        if (viewCount > gamenative::xr::FrameTransport::kEyeCount) {
+            viewCount = gamenative::xr::FrameTransport::kEyeCount;
+        }
 
+        std::array<gamenative::xr::EyeFrame,
+                   gamenative::xr::FrameTransport::kEyeCount> sourceFrames{};
+        std::array<bool, gamenative::xr::FrameTransport::kEyeCount> freshFrames{};
+        std::array<uint32_t, gamenative::xr::FrameTransport::kEyeCount> outputImageIndices{};
+        std::array<bool, gamenative::xr::FrameTransport::kEyeCount> outputAcquired{};
+
+        // Claim both producer images before touching an OpenXR output swapchain. This keeps
+        // a partial stereo frame from being submitted and makes failure cleanup deterministic.
         for (uint32_t eye = 0; eye < viewCount; ++eye) {
-            compositionViews[eye] = {
-                XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            auto& swapchain = eyeSwapchains[eye];
-            gamenative::xr::EyeFrame sourceFrame;
-            bool freshFrame = false;
-            if (!importEyeBuffer(static_cast<int>(eye), sourceFrame, freshFrame)) return false;
-
-            uint32_t imageIndex = 0;
-            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            if (xrFailed(xrAcquireSwapchainImage(
-                    swapchain.swapchain, &acquireInfo, &imageIndex),
-                    "xrAcquireSwapchainImage(stereo)")) {
-                if (freshFrame) {
-                    frameTransport.discardFrame(
-                        static_cast<int>(eye), sourceFrame.imageIndex,
-                        sourceFrame.serial);
-                    eyeRenderedSerial[eye] = sourceFrame.serial;
+            if (!importEyeBuffer(
+                    static_cast<int>(eye), sourceFrames[eye], freshFrames[eye])) {
+                for (uint32_t claimed = 0; claimed < eye; ++claimed) {
+                    if (freshFrames[claimed]) {
+                        frameTransport.discardFrame(
+                            static_cast<int>(claimed), sourceFrames[claimed].imageIndex,
+                            sourceFrames[claimed].serial);
+                        eyeRenderedSerial[claimed] = sourceFrames[claimed].serial;
+                    }
                 }
                 return false;
             }
+        }
+
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            auto& swapchain = eyeSwapchains[eye];
+            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if (xrFailed(xrAcquireSwapchainImage(
+                    swapchain.swapchain, &acquireInfo, &outputImageIndices[eye]),
+                    "xrAcquireSwapchainImage(stereo)")) {
+                for (uint32_t acquired = 0; acquired < eye; ++acquired) {
+                    if (outputAcquired[acquired]) {
+                        XrSwapchainImageReleaseInfo releaseInfo{
+                            XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        xrReleaseSwapchainImage(
+                            eyeSwapchains[acquired].swapchain, &releaseInfo);
+                    }
+                }
+                for (uint32_t claimed = 0; claimed < viewCount; ++claimed) {
+                    if (freshFrames[claimed]) {
+                        frameTransport.discardFrame(
+                            static_cast<int>(claimed), sourceFrames[claimed].imageIndex,
+                            sourceFrames[claimed].serial);
+                        eyeRenderedSerial[claimed] = sourceFrames[claimed].serial;
+                    }
+                }
+                return false;
+            }
+            outputAcquired[eye] = true;
             XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             waitInfo.timeout = XR_INFINITE_DURATION;
             if (xrFailed(xrWaitSwapchainImage(
                     swapchain.swapchain, &waitInfo),
                     "xrWaitSwapchainImage(stereo)")) {
-                if (freshFrame) {
-                    frameTransport.discardFrame(
-                        static_cast<int>(eye), sourceFrame.imageIndex,
-                        sourceFrame.serial);
-                    eyeRenderedSerial[eye] = sourceFrame.serial;
+                for (uint32_t acquired = 0; acquired <= eye; ++acquired) {
+                    if (outputAcquired[acquired]) {
+                        XrSwapchainImageReleaseInfo releaseInfo{
+                            XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        xrReleaseSwapchainImage(
+                            eyeSwapchains[acquired].swapchain, &releaseInfo);
+                    }
+                }
+                for (uint32_t claimed = 0; claimed < viewCount; ++claimed) {
+                    if (freshFrames[claimed]) {
+                        frameTransport.discardFrame(
+                            static_cast<int>(claimed), sourceFrames[claimed].imageIndex,
+                            sourceFrames[claimed].serial);
+                        eyeRenderedSerial[claimed] = sourceFrames[claimed].serial;
+                    }
                 }
                 return false;
             }
+        }
 
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            compositionViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            auto& swapchain = eyeSwapchains[eye];
+            const auto& sourceFrame = sourceFrames[eye];
             glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                                   swapchain.images[imageIndex].image, 0);
+                                   swapchain.images[outputImageIndices[eye]].image, 0);
             blit2DTexture(
                 eyeTextures[eye][sourceFrame.imageIndex],
                 swapchain.width, swapchain.height, sourceFrame);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            if (freshFrame) {
-                const int releaseFenceFd = createReleaseFence();
-                frameTransport.publishReleaseFence(
-                    static_cast<int>(eye), sourceFrame.imageIndex, releaseFenceFd);
-                eyeRenderedSerial[eye] = sourceFrame.serial;
-            } else {
-                glFlush();
-            }
-
-            XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            xrReleaseSwapchainImage(swapchain.swapchain, &releaseInfo);
 
             if (sourceFrame.projectionValid) {
                 compositionViews[eye].pose.orientation = {
@@ -1703,6 +1865,50 @@ void main() {
             compositionViews[eye].subImage.swapchain = swapchain.swapchain;
             compositionViews[eye].subImage.imageRect.offset = {0, 0};
             compositionViews[eye].subImage.imageRect.extent = {swapchain.width, swapchain.height};
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        uint32_t freshCount = 0;
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            if (freshFrames[eye]) ++freshCount;
+        }
+        int sharedReleaseFence = freshCount != 0 ? createReleaseFence() : -1;
+        if (freshCount == 0) glFlush();
+
+        // Both eye blits are in the same GLES queue, so one native fence represents all
+        // sampling work. Duplicate that fd for independently reacquired producer slots.
+        std::array<int, gamenative::xr::FrameTransport::kEyeCount> releaseFences{-1, -1};
+        if (sharedReleaseFence >= 0) {
+            uint32_t remaining = freshCount;
+            bool duplicateFailed = false;
+            for (uint32_t eye = 0; eye < viewCount; ++eye) {
+                if (!freshFrames[eye]) continue;
+                --remaining;
+                releaseFences[eye] = remaining == 0 ? sharedReleaseFence : ::dup(sharedReleaseFence);
+                if (releaseFences[eye] < 0) duplicateFailed = true;
+            }
+            if (duplicateFailed) {
+                for (int& fence : releaseFences) {
+                    if (fence >= 0) ::close(fence);
+                    fence = -1;
+                }
+                // An fd duplication failure is exceptional. Finish before publishing the
+                // fence-less release so the producer still cannot overwrite sampled data.
+                glFinish();
+            }
+        }
+
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            if (freshFrames[eye]) {
+                frameTransport.publishReleaseFence(
+                    static_cast<int>(eye), sourceFrames[eye].imageIndex,
+                    releaseFences[eye]);
+                eyeRenderedSerial[eye] = sourceFrames[eye].serial;
+            }
+            if (outputAcquired[eye]) {
+                XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(eyeSwapchains[eye].swapchain, &releaseInfo);
+            }
         }
 
         projectionLayer.space = appSpace;
@@ -1751,7 +1957,10 @@ void main() {
             XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
             createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
             createInfo.format = selectedFormat;
-            createInfo.sampleCount = cfg.recommendedSwapchainSampleCount;
+            // These images only receive a full-screen copy from the already-rendered game
+            // eye. Multisampling the compositor copy adds memory/bandwidth without improving
+            // image quality, even if the runtime recommends MSAA for native scene rendering.
+            createInfo.sampleCount = 1;
             createInfo.width = swapchain.width;
             createInfo.height = swapchain.height;
             createInfo.faceCount = 1;
@@ -2073,14 +2282,14 @@ void main() {
         }
     }
 
-    void pollEvents() {
+    void pollEvents(JNIEnv* env) {
         XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
         while (xrPollEvent(instance, &event) == XR_SUCCESS) {
             switch (event.type) {
                 case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
                     auto* changed = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
                     sessionState = changed->state;
-                    handleSessionState();
+                    handleSessionState(env);
                     break;
                 }
                 case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
@@ -2093,12 +2302,48 @@ void main() {
         }
     }
 
-    void handleSessionState() {
+    void applySustainedHighPerformance(JNIEnv* env) {
+        if (!performanceSettingsEnabled || setPerformanceLevel == nullptr ||
+            session == XR_NULL_HANDLE) {
+            return;
+        }
+
+        const XrResult cpuResult = setPerformanceLevel(
+            session,
+            XR_PERF_SETTINGS_DOMAIN_CPU_EXT,
+            XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+        const XrResult gpuResult = setPerformanceLevel(
+            session,
+            XR_PERF_SETTINGS_DOMAIN_GPU_EXT,
+            XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+        if (XR_SUCCEEDED(cpuResult) && XR_SUCCEEDED(gpuResult)) {
+            LOGI("Quest performance profile applied: CPU=SustainedHigh GPU=SustainedHigh");
+            publishDiagnostic(
+                env,
+                "Quest performance profile: CPU=SustainedHigh GPU=SustainedHigh");
+        } else {
+            LOGW(
+                "Quest SustainedHigh request failed: cpu=%d gpu=%d",
+                cpuResult,
+                gpuResult);
+            char diagnostic[128] = {};
+            std::snprintf(
+                diagnostic,
+                sizeof(diagnostic),
+                "Quest SustainedHigh request failed: cpu=%d gpu=%d",
+                cpuResult,
+                gpuResult);
+            publishDiagnostic(env, diagnostic);
+        }
+    }
+
+    void handleSessionState(JNIEnv* env) {
         switch (sessionState) {
             case XR_SESSION_STATE_READY: {
                 XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
                 beginInfo.primaryViewConfigurationType = kViewType;
                 if (!xrFailed(xrBeginSession(session, &beginInfo), "xrBeginSession")) {
+                    applySustainedHighPerformance(env);
                     sessionRunning = true;
                 }
                 break;
@@ -2131,6 +2376,175 @@ void main() {
         orientationValid =
             (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
         return viewCount;
+    }
+
+    static XrVector3f rotateVector(const XrQuaternionf& q, const XrVector3f& v) {
+        const XrVector3f uv{
+            q.y * v.z - q.z * v.y,
+            q.z * v.x - q.x * v.z,
+            q.x * v.y - q.y * v.x,
+        };
+        const XrVector3f uuv{
+            q.y * uv.z - q.z * uv.y,
+            q.z * uv.x - q.x * uv.z,
+            q.x * uv.y - q.y * uv.x,
+        };
+        return {
+            v.x + 2.0f * (q.w * uv.x + uuv.x),
+            v.y + 2.0f * (q.w * uv.y + uuv.y),
+            v.z + 2.0f * (q.w * uv.z + uuv.z),
+        };
+    }
+
+    bool buildMenuPanelPose(XrPosef& pose) const {
+        pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.05f}};
+        if (!handInputs[0].active || !handInputs[0].aimValid) return false;
+
+        pose.orientation = handInputs[0].aim.orientation;
+        // Float the panel just inboard and ahead of the left controller. Because the
+        // transform follows the aim pose, raising or rotating the wrist carries the panel.
+        const XrVector3f localOffset{0.19f, 0.09f, -0.30f};
+        const XrVector3f worldOffset = rotateVector(pose.orientation, localOffset);
+        pose.position = {
+            handInputs[0].aim.position.x + worldOffset.x,
+            handInputs[0].aim.position.y + worldOffset.y,
+            handInputs[0].aim.position.z + worldOffset.z,
+        };
+        return true;
+    }
+
+    void configureMenuQuad(
+        XrCompositionLayerQuad& layer,
+        const XrPosef& panelPose,
+        bool handAnchored) {
+        layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        layer.space = handAnchored || viewSpace == XR_NULL_HANDLE ? appSpace : viewSpace;
+        layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        layer.subImage.swapchain = menuSwapchain.swapchain;
+        layer.subImage.imageRect.offset = {0, 0};
+        layer.subImage.imageRect.extent = {menuSwapchain.width, menuSwapchain.height};
+        layer.pose = panelPose;
+        layer.size = {0.52f, 0.65f};
+    }
+
+    void publishMenuPointer(
+        JNIEnv* env,
+        float x,
+        float y,
+        bool active,
+        bool select) {
+        if (env == nullptr || activityMenuPointerMethod == nullptr) return;
+        const bool moved = std::fabs(x - lastMenuPointerX) >= 0.004f ||
+            std::fabs(y - lastMenuPointerY) >= 0.004f;
+        if (!select && active == lastMenuPointerActive && (!active || !moved)) return;
+        lastMenuPointerActive = active;
+        lastMenuPointerX = x;
+        lastMenuPointerY = y;
+        env->CallVoidMethod(
+            activityRef,
+            activityMenuPointerMethod,
+            static_cast<jfloat>(x),
+            static_cast<jfloat>(y),
+            static_cast<jboolean>(active),
+            static_cast<jboolean>(select));
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    void updateFlatPresentationState(JNIEnv* env, bool stereoRendered, bool renderableFrame) {
+        if (env == nullptr || activityStereoPresentationMethod == nullptr) return;
+        if (stereoRendered) {
+            consecutiveStereoMisses = 0;
+            if (!flatPresentationSuspended) {
+                flatPresentationSuspended = true;
+                env->CallVoidMethod(activityRef, activityStereoPresentationMethod, JNI_TRUE);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGI("Flat X-server compositor suspended after stereo handoff");
+            }
+            return;
+        }
+
+        // A single late or unavailable eye must not thrash the expensive Vulkan surface.
+        // Resume only after roughly half a second of continuously missing stereo frames.
+        if (flatPresentationSuspended && renderableFrame &&
+            ++consecutiveStereoMisses >= kStereoFallbackFrames) {
+            flatPresentationSuspended = false;
+            consecutiveStereoMisses = 0;
+            env->CallVoidMethod(activityRef, activityStereoPresentationMethod, JNI_FALSE);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            LOGI("Flat X-server compositor resumed for persistent stereo fallback");
+        }
+    }
+
+    void updateMenuPointer(JNIEnv* env, const XrPosef& panelPose, bool handAnchored) {
+        const bool triggerPressed = handInputs[1].trigger >= 0.68f;
+        bool active = false;
+        float x = 0.5f;
+        float y = 0.5f;
+        if (handAnchored && handInputs[1].active && handInputs[1].aimValid) {
+            const XrQuaternionf inverse{
+                -panelPose.orientation.x,
+                -panelPose.orientation.y,
+                -panelPose.orientation.z,
+                panelPose.orientation.w,
+            };
+            const XrVector3f delta{
+                handInputs[1].aim.position.x - panelPose.position.x,
+                handInputs[1].aim.position.y - panelPose.position.y,
+                handInputs[1].aim.position.z - panelPose.position.z,
+            };
+            const XrVector3f localOrigin = rotateVector(inverse, delta);
+            const XrVector3f worldDirection = rotateVector(
+                handInputs[1].aim.orientation,
+                XrVector3f{0.0f, 0.0f, -1.0f});
+            const XrVector3f localDirection = rotateVector(inverse, worldDirection);
+            if (std::fabs(localDirection.z) > 0.0001f) {
+                const float distance = -localOrigin.z / localDirection.z;
+                if (distance > 0.0f && distance < 5.0f) {
+                    const float localX = localOrigin.x + localDirection.x * distance;
+                    const float localY = localOrigin.y + localDirection.y * distance;
+                    constexpr float width = 0.52f;
+                    constexpr float height = 0.65f;
+                    x = localX / width + 0.5f;
+                    y = 0.5f - localY / height;
+                    active = x >= 0.0f && x <= 1.0f && y >= 0.0f && y <= 1.0f;
+                }
+            }
+        }
+        const bool select = active && triggerPressed && !lastMenuTriggerPressed;
+        publishMenuPointer(env, x, y, active, select);
+        lastMenuTriggerPressed = triggerPressed;
+    }
+
+    void applyRequestedRuntimeSettings(JNIEnv* env) {
+        const bool requestedTheater =
+            requestedTheaterScreenEnabled.load(std::memory_order_acquire);
+        if (requestedTheater != appliedTheaterRequest) {
+            appliedTheaterRequest = requestedTheater;
+            if (requestedTheater) {
+                theaterScreenEnabled = createScreenSwapchainImages() &&
+                    (blitProgram != 0 || createBlitResources());
+                LOGI("Theater fallback live setting applied: %u", theaterScreenEnabled ? 1u : 0u);
+            } else {
+                theaterScreenEnabled = false;
+                destroyScreenSwapchain();
+                LOGI("Theater fallback live setting applied: 0");
+            }
+        }
+
+        const bool requestedClock = requestedClockEnabled.load(std::memory_order_acquire);
+        if (requestedClock != appliedClockRequest) {
+            appliedClockRequest = requestedClock;
+            if (requestedClock) {
+                clockEnabled = (clockSwapchain.swapchain != XR_NULL_HANDLE || createClockSwapchain()) &&
+                    (overlayReady || createOverlayResources());
+                overlayReady = overlayReady || clockEnabled;
+            } else {
+                clockEnabled = false;
+            }
+            renderedClockMinute = -1;
+            LOGI("Clock live setting applied: %u", clockEnabled ? 1u : 0u);
+            if (clockEnabled) publishOverlayReady(env);
+        }
     }
 
     void configureScreenQuad(XrCompositionLayerQuad& layer, bool headFacing) {
@@ -2168,6 +2582,7 @@ void main() {
         uint32_t submittedLayerCount = 0;
 
         syncInput(frameState.predictedDisplayTime);
+        applyRequestedRuntimeSettings(env);
         // Publish timing only after controller state is current. WAIT_FRAME on the
         // Windows side wakes on this callback, so this ordering avoids returning the
         // previous headset frame's input to the game.
@@ -2178,19 +2593,24 @@ void main() {
             if (showMenu) {
                 menuScreenReady = ensureMenuScreenResources(env);
                 if (menuScreenReady) {
-                    LOGI("VR quick menu panel activated");
+                    LOGI("Left-hand VR settings panel activated (dedicated swapchain)");
                 } else {
                     LOGE("VR quick menu panel resources unavailable");
                 }
             } else {
                 menuScreenReady = false;
-                if (!theaterScreenEnabled) destroyScreenSwapchain();
                 destroyMenuExternalTextureSurface(env, true);
-                LOGI("VR quick menu panel deactivated");
+                destroyMenuSwapchain();
+                lastMenuPointerActive = false;
+                lastMenuTriggerPressed = false;
+                LOGI("Left-hand VR settings panel deactivated; resources released");
             }
             lastMenuVisible = showMenu;
         }
-        const bool showFlatMenu = showMenu && menuScreenReady;
+        const bool showSettingsPanel = showMenu && menuScreenReady;
+        XrPosef menuPanelPose{};
+        const bool menuHandAnchored = showSettingsPanel && buildMenuPanelPose(menuPanelPose);
+        if (showSettingsPanel) updateMenuPointer(env, menuPanelPose, menuHandAnchored);
 
         const bool stereoRendered = frameState.shouldRender && viewsValid &&
             renderStereoProjection(viewCount, projectionLayer, submittedLayer);
@@ -2202,10 +2622,10 @@ void main() {
                     stereoMilestonePublished = true;
                 }
             }
-        } else if (frameState.shouldRender && (theaterScreenEnabled || showFlatMenu) &&
+        } else if (frameState.shouldRender && theaterScreenEnabled &&
                    screenSwapchain.swapchain != XR_NULL_HANDLE) {
-            renderScreenTexture(showFlatMenu);
-            configureScreenQuad(quadLayer, showFlatMenu);
+            renderScreenTexture(false);
+            configureScreenQuad(quadLayer, false);
             submittedLayer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
         } else if (frameState.shouldRender && theaterScreenEnabled && viewsValid &&
                    !eyeSwapchains.empty()) {
@@ -2232,9 +2652,9 @@ void main() {
         }
 
         if (submittedLayer != nullptr) submittedLayers[submittedLayerCount++] = submittedLayer;
-        if (frameState.shouldRender && stereoRendered && showFlatMenu) {
+        if (frameState.shouldRender && showSettingsPanel) {
             renderScreenTexture(true);
-            configureScreenQuad(menuLayer, true);
+            configureMenuQuad(menuLayer, menuPanelPose, menuHandAnchored);
             submittedLayers[submittedLayerCount++] =
                 reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menuLayer);
         }
@@ -2249,7 +2669,12 @@ void main() {
         endInfo.environmentBlendMode = blendMode;
         endInfo.layerCount = submittedLayerCount;
         endInfo.layers = submittedLayerCount == 0 ? nullptr : submittedLayers.data();
-        xrEndFrame(session, &endInfo);
+        const XrResult endResult = xrEndFrame(session, &endInfo);
+        if (XR_FAILED(endResult)) {
+            LOGE("xrEndFrame failed: %d", endResult);
+        } else {
+            updateFlatPresentationState(env, stereoRendered, frameState.shouldRender == XR_TRUE);
+        }
     }
 
     // Publish predicted timing + full per-eye poses/FOV to the activity, which forwards
@@ -2306,8 +2731,10 @@ void main() {
             ? menuSurfaceTextureUpdateTexImage
             : surfaceTextureUpdateTexImage;
         const GLuint sourceTexture = useMenuTexture ? menuExternalTexture : externalTexture;
+        ScreenSwapchain& targetSwapchain = useMenuTexture ? menuSwapchain : screenSwapchain;
         if (textureRef == nullptr || updateTexImage == nullptr ||
-            sourceTexture == 0 || blitProgram == 0) {
+            sourceTexture == 0 || blitProgram == 0 ||
+            targetSwapchain.swapchain == XR_NULL_HANDLE) {
             return;
         }
 
@@ -2323,21 +2750,29 @@ void main() {
 
         uint32_t imageIndex = 0;
         XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if (xrFailed(xrAcquireSwapchainImage(screenSwapchain.swapchain, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage(screen)")) return;
+        if (xrFailed(xrAcquireSwapchainImage(
+                targetSwapchain.swapchain, &acquireInfo, &imageIndex),
+                useMenuTexture
+                    ? "xrAcquireSwapchainImage(settings)"
+                    : "xrAcquireSwapchainImage(screen)")) return;
 
         XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         waitInfo.timeout = XR_INFINITE_DURATION;
-        if (xrFailed(xrWaitSwapchainImage(screenSwapchain.swapchain, &waitInfo), "xrWaitSwapchainImage(screen)")) return;
+        if (xrFailed(xrWaitSwapchainImage(
+                targetSwapchain.swapchain, &waitInfo),
+                useMenuTexture
+                    ? "xrWaitSwapchainImage(settings)"
+                    : "xrWaitSwapchainImage(screen)")) return;
 
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glFramebufferTexture2D(
             GL_FRAMEBUFFER,
             GL_COLOR_ATTACHMENT0,
             GL_TEXTURE_2D,
-            screenSwapchain.images[imageIndex].image,
+            targetSwapchain.images[imageIndex].image,
             0);
 
-        glViewport(0, 0, screenSwapchain.width, screenSwapchain.height);
+        glViewport(0, 0, targetSwapchain.width, targetSwapchain.height);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glUseProgram(blitProgram);
@@ -2353,7 +2788,7 @@ void main() {
         glFlush();
 
         XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(screenSwapchain.swapchain, &releaseInfo);
+        xrReleaseSwapchainImage(targetSwapchain.swapchain, &releaseInfo);
     }
 
     void renderEye(uint32_t eye) {
@@ -2423,6 +2858,7 @@ void main() {
             surfaceTextureUpdateTexImage = nullptr;
         }
         destroyMenuExternalTextureSurface(env, false);
+        destroyMenuSwapchain();
         destroyScreenSwapchain();
         for (auto& swapchain : eyeSwapchains) {
             if (swapchain.swapchain != XR_NULL_HANDLE) {
@@ -2605,5 +3041,20 @@ Java_app_gamenative_xr_QuestVrActivity_nativeSetMenuVisible(
     auto* app = reinterpret_cast<QuestXrApp*>(handle);
     if (app != nullptr) {
         app->setMenuVisible(visible == JNI_TRUE);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_app_gamenative_xr_QuestVrActivity_nativeSetRuntimeSettings(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jboolean theaterScreenEnabled,
+    jboolean clockEnabled) {
+    auto* app = reinterpret_cast<QuestXrApp*>(handle);
+    if (app != nullptr) {
+        app->setRuntimeSettings(
+            theaterScreenEnabled == JNI_TRUE,
+            clockEnabled == JNI_TRUE);
     }
 }

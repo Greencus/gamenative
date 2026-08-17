@@ -18,7 +18,7 @@ typedef unsigned long long gn_u64;
 typedef signed long long gn_i64;
 #endif
 
-#define GN_UNIX_ABI_VERSION 4u
+#define GN_UNIX_ABI_VERSION 5u
 #define GN_UNIX_MAX_SWAPCHAINS 32u
 #define GN_UNIX_MAX_IMAGES 4u
 
@@ -29,6 +29,7 @@ enum gn_unix_call_code {
     GN_UNIX_DESTROY_SWAPCHAIN,
     GN_UNIX_ACQUIRE_IMAGE,
     GN_UNIX_SUBMIT_IMAGE,
+    GN_UNIX_SUBMIT_STEREO,
     GN_UNIX_CALL_COUNT
 };
 
@@ -94,6 +95,20 @@ struct gn_unix_acquire_image_args {
     gn_i32 result;
 };
 
+struct gn_unix_submit_view_args {
+    gn_u32 slot;
+    gn_u32 image_index;
+    gn_u32 eye;
+    gn_u32 array_index;
+    gn_i32 rect_x;
+    gn_i32 rect_y;
+    gn_u32 rect_width;
+    gn_u32 rect_height;
+    gn_i64 orientation_micro[4];
+    gn_i64 position_micro[3];
+    gn_i64 fov_micro[4];
+};
+
 struct gn_unix_submit_image_args {
     gn_u32 slot;
     gn_u32 image_index;
@@ -106,6 +121,12 @@ struct gn_unix_submit_image_args {
     gn_i64 orientation_micro[4];
     gn_i64 position_micro[3];
     gn_i64 fov_micro[4];
+    gn_i32 result;
+};
+
+struct gn_unix_submit_stereo_args {
+    gn_u32 view_count;
+    struct gn_unix_submit_view_args views[2];
     gn_i32 result;
 };
 #pragma pack(pop)

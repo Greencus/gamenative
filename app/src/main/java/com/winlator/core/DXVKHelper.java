@@ -16,9 +16,15 @@ public class DXVKHelper {
     }
 
     public static void setEnvVars(Context context, KeyValueSet config, EnvVars envVars) {
+        setEnvVars(context, config, envVars, false);
+    }
+
+    public static void setEnvVars(Context context, KeyValueSet config, EnvVars envVars,
+                                  boolean latencySensitive) {
         ImageFs imageFs = ImageFs.find(context);
         envVars.put("DXVK_STATE_CACHE_PATH", "/data/data/app.gamenative/files/imagefs"+ImageFs.CACHE_PATH);
         envVars.put("DXVK_LOG_LEVEL", "none");
+        envVars.put("DXVK_LOG_PATH", "none");
 
         File rootDir = ImageFs.find(context).getRootDir();
         File dxvkConfigFile = new File(imageFs.config_path+"/dxvk.conf");
@@ -49,6 +55,12 @@ public class DXVKHelper {
         if (config.getBoolean("constantBufferRangeCheck")) {
             content = content + "d3d11.constantBufferRangeCheck = \"True\"\n";
         }
+
+        // DXVK otherwise uses every available core for background pipeline compilation.
+        // In VR that can pre-empt Wine, the bridge, and the compositor at the same time,
+        // producing long-tail frame spikes. Two workers retain parallel compilation while
+        // bounding CPU contention and compiler working-set memory.
+        if (latencySensitive) content += "dxvk.numCompilerThreads = 2\n";
 
         String async = config.get("async");
         if (!async.isEmpty() && !async.equals("0"))

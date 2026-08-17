@@ -34,10 +34,16 @@ import java.util.List;
 import java.util.Stack;
 import java.util.UUID;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 public abstract class FileUtils {
+    private static final ExecutorService SIZE_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "file-size-scanner");
+        thread.setDaemon(true);
+        return thread;
+    });
     public static byte[] read(Context context, String assetFile) {
         try (InputStream inStream = context.getAssets().open(assetFile)) {
             return StreamUtils.copyToByteArray(inStream);
@@ -345,7 +351,7 @@ public abstract class FileUtils {
     }
 
     public static void getSizeAsync(File file, Callback<Long> callback) {
-        Executors.newSingleThreadExecutor().execute(() -> getSize(file, callback));
+        SIZE_EXECUTOR.execute(() -> getSize(file, callback));
     }
 
     private static void getSize(File file, Callback<Long> callback) {

@@ -213,7 +213,7 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         File rootDir = imageFs.getRootDir();
 
         PrefManager.init(context);
-        boolean enableBox86_64Logs = PrefManager.getBoolean("enable_box86_64_logs", true);
+        boolean enableBox86_64Logs = PrefManager.getBoolean("enable_box86_64_logs", false);
         boolean shareAndroidClipboard = PrefManager.getBoolean("share_android_clipboard", false);
         boolean enablePebLogs = PrefManager.getBoolean("enable_peb_logs", false);
 
@@ -355,7 +355,9 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             BionicFgManager.applyLaunchEnv(container, envVars);
         }
 
-        Log.d("BionicProgramLauncherComponent", "env vars are " + envVars.toString());
+        if (enableBox86_64Logs) {
+            Log.d("BionicProgramLauncherComponent", "Guest environment prepared with emulator logging enabled");
+        }
 
         String emulator = container.getEmulator();
 

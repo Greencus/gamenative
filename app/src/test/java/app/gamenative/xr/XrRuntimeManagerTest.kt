@@ -62,7 +62,7 @@ class XrRuntimeManagerTest {
     @Test
     fun `XR unix bridge is forced to Wine builtin mode`() {
         assertEquals(
-            "gamenative_xr_unixbridge=b",
+            "gameoverlayrenderer=n;gameoverlayrenderer64=n;gamenative_xr_unixbridge=b",
             XrRuntimeManager.runtimeDllOverrides(""),
         )
     }
@@ -70,7 +70,7 @@ class XrRuntimeManagerTest {
     @Test
     fun `XR unix bridge override preserves game-specific Wine overrides`() {
         assertEquals(
-            "mf=n;mfmediaengine=n;gamenative_xr_unixbridge=b",
+            "mf=n;mfmediaengine=n;gameoverlayrenderer=n;gameoverlayrenderer64=n;gamenative_xr_unixbridge=b",
             XrRuntimeManager.runtimeDllOverrides("mf=n;mfmediaengine=n;"),
         )
     }
